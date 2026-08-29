@@ -1,0 +1,72 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "omniteleop"
+version = "0.4.0"
+description = "Quest 3 whole-body teleoperation and HDF5 recording for Dexmate Vega"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "Dexmate Team" }]
+keywords = ["robotics", "teleoperation", "webxr", "data-collection"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "aiohttp>=3.10",
+    "coal>=3.0,<4",
+    "daqp>=0.7",
+    "dexbot-utils>=0.4",
+    "dexcomm>=0.6,<0.7",
+    "dexcontrol>=0.5",
+    "dexmate-urdf==0.8.0",
+    "dextop>=0.5",
+    "h5py>=3.10",
+    "loguru>=0.6",
+    "numpy>=1.26",
+    "opencv-python>=4.8",
+    "pin>=3.8,<4",
+    "pink-dm-fork>=3.1,<4",
+    "python-socketio>=5.13",
+    "pytransform3d>=3.14",
+    "pyyaml>=6",
+    "qpsolvers>=4.4,<5",
+    "scipy>=1.11",
+    "tyro>=0.8",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.9"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/omniteleop"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/omniteleop",
+    "scripts",
+    "config/ee_offset.example.yaml",
+    ".gitignore",
+    ".python-version",
+    "LICENSE",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md",
+    "uv.lock",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
