@@ -4,26 +4,81 @@ These dataclasses define the structure of messages passed via Zenoh.
 """
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, Dict, List
+
+
+@dataclass
+class ExoJointData:
+    """Joint positions and velocities from the exoskeleton."""
+
+    timestamp_ns: int
+    left_arm_pos: List[float] = field(default_factory=list)  # Left arm joint positions in radians
+    left_arm_vel: List[float] = field(default_factory=list)  # Left arm joint velocities in rad/s
+    right_arm_pos: List[float] = field(default_factory=list)  # Right arm joint positions in radians
+    right_arm_vel: List[float] = field(default_factory=list)  # Right arm joint velocities in rad/s
+
+
+@dataclass
+class JoyConData:
+    """JoyCon controller inputs."""
+
+    timestamp_ns: int
+    left: Dict[str, Any]  # Left controller data
+    right: Dict[str, Any]  # Right controller data
+
+
+@dataclass
+class SafeJointCommand:
+    """Safety-validated commands for the robot."""
+
+    timestamp_ns: int
+    components: Dict[str, Dict[str, List[float]]]  # Component commands
+    safety_flags: Dict[str, bool] = field(default_factory=dict)
+
+
+@dataclass
+class PoseData:
+    """Pose data from the VR headset."""
+
+    timestamp_ns: int
+    left: Dict[str, Any]
+    right: Dict[str, Any]
 
 
 @dataclass
 class VRJointData:
-    """VR state and Cartesian targets streamed by the WebXR leader.
+    """Teleoperation commands, Cartesian targets, and session controls over Zenoh.
 
-    The leader maps Quest 3 controller and headset poses into calibrated robot-frame
-    targets. The follower subscribes and solves whole-body IK on its live state.
+    WBC leaders publish EEF/head poses; legacy joint fields remain for compatibility.
+    Joystick followers also consume chassis intent and the selected torso mode.
     """
 
     timestamp_ns: int
+    # Arm joint positions (7-DOF each), radians. Empty = not yet calibrated.
+    left_arm_pos: List[float] = field(default_factory=list)
+    right_arm_pos: List[float] = field(default_factory=list)
+    # Head joint positions (3-DOF), radians
+    head_pos: List[float] = field(default_factory=list)
     # Gripper scale [0.0 = open, 1.0 = fully closed] mapped from controller trigger
     left_gripper: float = 0.0
     right_gripper: float = 0.0
+    # Base velocity from Quest thumbsticks (m/s, rad/s)
+    chassis_vx: float = 0.0  # forward (+) / back (-)
+    chassis_vy: float = 0.0  # left (+) / right (-)
+    chassis_wz: float = 0.0  # counter-clockwise (+)
+    # Torso height command from the joystick leader's left stick Y (m/s, up +). Zero unless
+    # the leader runs --torso-stick; the joystick follower reads it only with --torso-stick.
+    torso_vz: float = 0.0
+    # Torso mode the joystick leader runs: "" (fixed torso), "stick" (--torso-stick) or "ik"
+    # (--torso-ik). A live joystick follower holds unless it runs the same mode.
+    torso_mode: str = ""
     # Control flags
     estop: bool = True  # Default True (safe) until calibration completes
     exit_requested: bool = False
     home_requested: bool = False
-    # Calibration stage published by the leader: static or teleop.
+    scenediff_request_id: str = ""
+    # Calibration stage published by the leader. wbc_vr_leader uses {static, teleop};
+    # omni-vr/vr_reader uses {static, head, whole_body_alignment, whole_body, resetting}.
     calib_stage: str = "static"
     left_ee_pose: List[float] = field(default_factory=list)
     right_ee_pose: List[float] = field(default_factory=list)
@@ -31,7 +86,7 @@ class VRJointData:
     # calibration -- the head-frame (zed_depth_frame) teleop target. Published by
     # wbc_vr_leader; the WBC follower solves its own head IK against this from the
     # live whole-body configuration (so base yaw / torso lean are compensated).
-    # Empty when not teleoperating.
+    # Empty when not teleoperating. vr_reader publishes head_pos joints instead.
     head_ee_pose: List[float] = field(default_factory=list)
 
 
@@ -53,6 +108,16 @@ class WBCFollowerStatus:
     held: bool = False
     hold: bool = True
     hold_reason: str = ""
+    home_required: bool = False
     safety_status: str = "ok"
     left_ee_error_mm: float = 0.0
     right_ee_error_mm: float = 0.0
+    scenediff_enabled: bool = False
+    scenediff_request_id: str = ""
+    scenediff_state: str = ""
+    scenediff_path: str = ""
+    # Index the follower's episode recorder will write next: the episode currently being
+    # recorded while ``recording``, otherwise the id the next take will claim (the
+    # recorder increments it on stop()). -1 when the follower runs without ``--record``,
+    # which is how the HUD knows to omit the line.
+    episode_id: int = -1

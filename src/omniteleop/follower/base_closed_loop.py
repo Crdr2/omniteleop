@@ -58,9 +58,9 @@ def validate_config(
     default_ang_speed: float,
 ) -> None:
     """Validate closed-loop config and its fallback speed limits."""
-    if config.source not in ("none", "odom"):
+    if config.source not in ("none", "odom", "arkit"):
         raise ValueError(
-            f"--closed-loop-source must be one of 'none' or 'odom', got {config.source!r}"
+            f"--closed-loop-source must be one of 'none', 'odom' or 'arkit', got {config.source!r}"
         )
     positive = {
         "closed_loop_rate": config.rate,
@@ -368,8 +368,9 @@ def shape_project_twist(
     masked/projected twist safe to dispatch. A non-``None`` ``preferred_axis`` lets a
     direct operator command retain its selected intent axis while active. The WBC path
     omits it and uses the dominant post-PD command with configured hysteresis.
-    ``dispatch_single_axis_deadband`` is the final chassis quiet floor. Keeping it below
-    the upstream IK intent floor lets a valid acceleration ramp reach the chassis.
+    ``dispatch_single_axis_deadband`` is the final chassis quiet floor, kept separate from
+    (and lower than) the upstream WBIK/joystick intent floor ``single_axis_deadband`` so a
+    valid command's acceleration ramp is dispatched instead of being chopped back to zero.
     """
     shaped = shape_twist(
         raw,

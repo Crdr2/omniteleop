@@ -1,40 +1,12 @@
-"""Tier 2 latency prototype: a vectorized all-sphere self-collision barrier.
+"""Vectorized sphere-only implementation of Pink's self-collision barrier.
 
-`pink.barriers.SelfCollisionBarrier` dominates the WBC tick (~5.5 ms of 10 ms): each
-solve it reads coal's per-pair ``DistanceResult.min_distance`` over **all ~2900**
-cross-group pairs twice (in ``compute_barrier`` and ``compute_jacobian``, two Python
-loops over pybind objects), ranks them, then builds Jacobian rows for the closest
-``dim`` pairs with two ``getJointJacobian`` calls *per pair* (~240 calls).
+Rank pair clearances as ||center_a - center_b|| - radius_a - radius_b and
+assemble the closest-pair Jacobians using cached geometry and joint indices.
+Geometry placements replace coal narrowphase results; barrier values and
+Jacobians retain the stock Pink convention, including penetration normals.
 
-The Dexmate collision model is **all spheres**, so every quantity pink derives from
-coal has an exact closed form from the sphere centres ``c`` (= ``oMg[i].translation``)
-and radii ``r``:
-
-* signed clearance of pair ``(a, b)``:  ``d = ‖c_a - c_b‖ - r_a - r_b``  (== coal
-  ``min_distance``, validated bit-identically across separation/contact/penetration);
-* nearest (witness) points:  ``w1 = c_a - r_a u``, ``w2 = c_b + r_b u`` with
-  ``u = (c_a - c_b)/‖c_a - c_b‖``;
-* contact normal:  ``n = (w1 - w2)/‖w1 - w2‖ = sign(d) · u``.
-
-:class:`FastSelfCollisionBarrier` overrides ``compute_barrier`` / ``compute_jacobian``
-with this math: one vectorized numpy pass over the centres to rank pairs, then the
-Jacobian rows assembled with one ``getJointJacobian`` per **unique** joint (≤ ~20, not
-~240) and a couple of ``einsum`` contractions. It reads only ``collision_data.oMg``
-(geometry placements) and the robot Jacobians ``pin.computeJointJacobians`` already
-populated for the task rows -- **never coal's narrowphase results** -- so it reproduces
-pink's exact ``(h, J)`` and therefore the exact QP, while skipping the all-pair scan.
-
-The base :class:`~pink.barriers.barrier.Barrier` turns ``(h, J)`` into the QP rows
-identically (``G = -J/dt``, ``h = gain · h``); with ``safe_displacement_gain = 0`` (the
-WBC config) the barrier's QP **objective** is exactly zero, so reproducing ``compute_
-barrier`` and ``compute_jacobian`` is sufficient for full QP equivalence.
-
-This is a behavior-preserving drop-in for the barrier object, but the *full* latency win
-also needs the live ``Configuration`` to stop
-running coal ``computeDistances`` every tick (it does so unconditionally when a
-``collision_model`` is attached) -- that integration step touches ``whole_body_ik.py``
-and is deliberately deferred. See ``build_centers_from_placements`` for the
-narrowphase-free center source used by the standalone profiling/equivalence harness.
+With safe_displacement_gain=0, matching these quantities preserves the full
+barrier QP contribution. Equivalence is covered by test_fast_self_collision_barrier.
 """
 
 from __future__ import annotations
@@ -106,8 +78,16 @@ class FastSelfCollisionBarrier(SelfCollisionBarrier):
         )
         self._radius = np.array([float(g.geometry.radius) for g in geoms], dtype=float)
 
-    # -- shared broadphase ------------------------------------------------------
+    def refresh_geometry(self, collision_model: pin.GeometryModel) -> None:
+        """Refresh moving-sphere radii and invalidate Pink's same-q QP cache.
 
+        Placements are read live, but a gripper can move while arm q stays identical.
+        Pink otherwise reuses the previous barrier/Jacobian at that q.
+        """
+        self._radius[:] = [float(g.geometry.radius) for g in collision_model.geometryObjects]
+        self._Barrier__q_cache = None
+
+    # shared broadphase
     def _validate(self, configuration: Configuration) -> None:
         """Reject a configuration whose collision pairs no longer match the cache.
 
@@ -143,8 +123,7 @@ class FastSelfCollisionBarrier(SelfCollisionBarrier):
         idx = np.argpartition(-clearance, -self.dim)[-self.dim :]
         return clearance, idx
 
-    # -- pink Barrier overrides -------------------------------------------------
-
+    # pink Barrier overrides
     def compute_barrier(self, configuration: Configuration) -> np.ndarray:
         """Barrier vector ``h = clearance - d_min`` over the ``dim`` closest pairs."""
         self._validate(configuration)

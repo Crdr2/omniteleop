@@ -197,7 +197,20 @@ function renderCameras(pose) {
     // them in two rows in wbc_headset_hud.poll_and_send (which lowers the aspect).
     const camPanelH = 0.40;
     const camPanelW = camPanelH * (camAspect.img || 4.0);
-    if (camTex.img)  drawQuad(proj, _eyeView, 0.0, -0.3, -1.2, camPanelW, camPanelH, camTex.img);
+    // VERTICAL PLACEMENT KNOB. The quad is drawn in EYE space, so it stays pinned to this
+    // spot in the field of view wherever the operator looks. Dropping camPanelY moves the
+    // tiles out of the central passthrough cone -- dashboard style -- so the straight-ahead
+    // see-through view of the real scene stays unobstructed and the camera tiles are read
+    // with a downward glance. At z = -1.2 with camPanelH 0.40 the panel's top/bottom edges
+    // sit this far BELOW eye level:
+    //     camPanelY -0.30 ->  5 / 23 deg  (previous: tiles sat over the centre of view)
+    //     camPanelY -0.45 -> 12 / 31 deg
+    //     camPanelY -0.55 -> 16 / 32 deg   <- current
+    //     camPanelY -0.65 -> 21 / 35 deg   (previous)
+    //     camPanelY -0.75 -> 25 / 38 deg
+    //     camPanelY -0.85 -> 28 / 41 deg  (near the headset's ~45 deg lower FOV edge)
+    const camPanelY = -0.55;
+    if (camTex.img)  drawQuad(proj, _eyeView, 0.0, camPanelY, -1.2, camPanelW, camPanelH, camTex.img);
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
@@ -306,6 +319,10 @@ function onXRFrame(t, frame) {
     right_index_trigger:    rightCtrl.index,
     left_squeeze:           leftCtrl.squeeze,
     right_squeeze:          rightSqueezeDown ? 1.0 : rightCtrl.squeeze,
+    left_thumbstick:        leftCtrl.stick,
+    right_thumbstick:       rightCtrl.stick,
+    left_thumbstick_click:  leftCtrl.stickClick,
+    right_thumbstick_click: rightCtrl.stickClick,
     right_a_button:         rightCtrl.a,
     right_b_button:         rightCtrl.b_btn,
     left_x_button:          leftCtrl.a,    // X on left controller (buttons[4])
@@ -326,12 +343,13 @@ function poseToDict(tf) {
   return { pos: [p.x, p.y, p.z], quat: [q.w, q.x, q.y, q.z] };
 }
 function identityPose() { return { pos: [0,0,0], quat: [1,0,0,0] }; }
-function defaultCtrl()  { return { index:0, squeeze:0, a:false, b_btn:false }; }
+function defaultCtrl()  { return { index:0, squeeze:0, stick:[0,0], stickClick:false, a:false, b_btn:false }; }
 
 function readGamepad(gp) {
   const b = (i) => gp.buttons[i] ? gp.buttons[i].value   : 0;
   const p = (i) => gp.buttons[i] ? gp.buttons[i].pressed : false;
-  return { index:b(0), squeeze:b(1), a:p(4), b_btn:p(5) };
+  return { index:b(0), squeeze:b(1), stick:[gp.axes[2]??0, gp.axes[3]??0],
+           stickClick:p(3), a:p(4), b_btn:p(5) };
 }
 
 function updateFps() {

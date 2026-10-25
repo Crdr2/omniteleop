@@ -1,0 +1,155 @@
+diff --git a/include/record3d/Record3DStream.h b/include/record3d/Record3DStream.h
+index 8f5b1f4..93a3838 100644
+--- a/include/record3d/Record3DStream.h
++++ b/include/record3d/Record3DStream.h
+@@ -97,6 +97,21 @@ namespace Record3D
+     public:
+         // Constants
+         static constexpr uint16_t DEVICE_PORT{ 1337 }; /** Port on iDevice that we are listening to for RGBD stream. */
++        static constexpr unsigned int DRAIN_POLL_TIMEOUT_MS{ 1 }; /** How long to wait for a queued message before declaring the current frame the newest (see `latestFrameOnly_`). */
++        static constexpr uint32_t DRAIN_MAX_FRAMES_PER_DELIVERY{ 1000 }; /** Watchdog cap on frames skipped between two deliveries, so the drain loop can never starve delivery indefinitely. */
++
++        /**
++         * When enabled, the runloop drains every message already queued on the USB socket and
++         * decodes + delivers ONLY the newest one, counting the discarded ones in `skippedFrames_`.
++         *
++         * Without this, whenever JPEG/LZFSE decoding plus the `onNewFrame` callback run slower than
++         * the iDevice produces frames, TCP backpressure queues the excess and the stream falls
++         * behind real time WITHOUT BOUND -- poses and images arrive seconds-to-minutes stale while
++         * looking perfectly fresh. Enable for live/real-time consumers; leave disabled for
++         * recording use-cases that must not drop frames.
++         */
++        std::atomic<bool> latestFrameOnly_{ false };
++        std::atomic<uint32_t> skippedFrames_{ 0 }; /** Number of stale frames skipped by `latestFrameOnly_`. */
+ 
+ #ifdef PYTHON_BINDINGS_BUILD
+         /**
+@@ -182,7 +197,7 @@ namespace Record3D
+             size_t currentFrameHeight = currentFrameConfidenceHeight_;
+ 
+             size_t bufferSize  = currentFrameWidth * currentFrameHeight * sizeof(uint8_t);
+-            auto result        = py::array_t<uint8_t>({ static_cast<int>(currentFrameHeight), static_cast<int>(currentFrameWidth) });
++            auto result        = py::array_t<uint8_t>({static_cast<int>(currentFrameHeight), static_cast<int>(currentFrameWidth)});
+             auto result_buffer = result.request();
+             uint8_t *result_ptr  = (uint8_t *) result_buffer.ptr;
+ 
+@@ -220,7 +235,7 @@ namespace Record3D
+ 
+             constexpr int numChannels = 3;
+             size_t bufferSize  = currentFrameWidth * currentFrameHeight * numChannels * sizeof(uint8_t);
+-            auto result        = py::array_t<uint8_t>({ static_cast<int>(currentFrameHeight), static_cast<int>(currentFrameWidth), numChannels });
++            auto result        = py::array_t<uint8_t>({static_cast<int>(currentFrameHeight), static_cast<int>(currentFrameWidth), numChannels});
+             auto result_buffer = result.request();
+             uint8_t *result_ptr  = (uint8_t *) result_buffer.ptr;
+ 
+diff --git a/python-bindings/src/PythonBindings.cpp b/python-bindings/src/PythonBindings.cpp
+index 49f7ec5..458f743 100644
+--- a/python-bindings/src/PythonBindings.cpp
++++ b/python-bindings/src/PythonBindings.cpp
+@@ -48,6 +48,13 @@ PYBIND11_MODULE( record3d, m )
+             .def("get_intrinsic_mat", &Record3D::Record3DStream::GetCurrentIntrinsicMatrix, "Returns the intrinsic matrix of current RGB frame.")
+             .def("get_camera_pose", &Record3D::Record3DStream::GetCurrentCameraPose, "Returns the camera pose of the current camera frame.")
+             .def("get_device_type", &Record3D::Record3DStream::GetCurrentDeviceType, "Returns the type of camera (TrueDeph = 0, LiDAR = 1).")
++            .def_property("latest_frame_only",
++                          []( Record3D::Record3DStream &$stream ) { return $stream.latestFrameOnly_.load(); },
++                          []( Record3D::Record3DStream &$stream, bool $enabled ) { $stream.latestFrameOnly_.store( $enabled ); },
++                          "When True, skip decoding of frames that already have a newer one queued behind them and deliver only the newest (bounds stream lag to ~one frame; skipped frames are counted in skipped_frames). Default False preserves the deliver-every-frame behaviour.")
++            .def_property_readonly("skipped_frames",
++                          []( Record3D::Record3DStream &$stream ) { return $stream.skippedFrames_.load(); },
++                          "Number of stale frames skipped so far because latest_frame_only is enabled.")
+             .def_readwrite("on_new_frame", &Record3D::Record3DStream::onNewFrame, "Method called upon receiving new frame.")
+             .def_readwrite("on_stream_stopped", &Record3D::Record3DStream::onStreamStopped, "Method called when stream is interrupted.")
+             ;
+diff --git a/src/Record3DStream.cpp b/src/Record3DStream.cpp
+index 6a7ff47..212b09a 100644
+--- a/src/Record3DStream.cpp
++++ b/src/Record3DStream.cpp
+@@ -140,6 +140,74 @@ namespace Record3D
+             if ( numReceivedData != messageBodySize )
+             { break; }
+ 
++            // 2.5 Latest-wins: if more messages are already queued on the socket, the one just
++            // received is stale -- skip its (expensive) decode entirely and replace it with the
++            // newer message, repeating until the socket goes quiet. Only the newest available
++            // frame reaches step 3. This bounds end-to-end lag to ~one frame instead of letting
++            // TCP backpressure accumulate an unbounded stale-frame backlog.
++            if ( latestFrameOnly_.load())
++            {
++                bool receiveFailed = false;
++                uint32_t numDrainedThisPass = 0;
++                // Cap the drain per delivery and re-check the flags each round: a
++                // finite backlog still clears within a few deliveries, while a
++                // pathological always-readable socket cannot starve delivery or
++                // keep Disconnect()/a flag flip from taking effect.
++                while ( connectionEstablished_.load() && latestFrameOnly_.load()
++                        && numDrainedThisPass < DRAIN_MAX_FRAMES_PER_DELIVERY )
++                {
++                    PeerTalkHeader nextHeader;
++                    uint32_t numPeeked = 0;
++                    int rc = usbmuxd_recv_timeout( socketHandle_, (char*) &nextHeader,
++                                                   sizeof( nextHeader ), &numPeeked,
++                                                   DRAIN_POLL_TIMEOUT_MS );
++                    // Timeout (rc == 0 && numPeeked == 0): nothing queued, current frame is
++                    // the newest. Negative rc: socket error/closed -- let the outer loop's
++                    // next blocking read handle it.
++                    if ( rc != 0 || numPeeked == 0 )
++                    { break; }
++
++                    if ( numPeeked < sizeof( nextHeader ))
++                    {
++                        uint32_t numRestBytes = sizeof( nextHeader ) - numPeeked;
++                        if ( ReceiveWholeBuffer( socketHandle_, ((uint8_t*) &nextHeader) + numPeeked,
++                                                 numRestBytes ) != numRestBytes )
++                        {
++                            receiveFailed = true;
++                            break;
++                        }
++                    }
++
++                    uint32_t nextBodySize = NTOHL_( nextHeader.body_size );
++                    // A body must at least hold the fixed-size prefix parsed in step 3, and a
++                    // huge length means a corrupt/desynced stream -- bail out rather than
++                    // attempting a multi-GiB allocation or parsing stale tail bytes.
++                    constexpr uint32_t minBodySize = sizeof( Record3DHeader )
++                                                     + sizeof( IntrinsicMatrixCoeffs )
++                                                     + sizeof( CameraPose );
++                    constexpr uint32_t maxBodySize = 128u * 1024u * 1024u;
++                    if ( nextBodySize < minBodySize || nextBodySize > maxBodySize )
++                    {
++                        receiveFailed = true;
++                        break;
++                    }
++                    if ( rawMessageBuffer.size() < nextBodySize )
++                    { rawMessageBuffer.resize( nextBodySize ); }
++                    if ( ReceiveWholeBuffer( socketHandle_, (uint8_t*) rawMessageBuffer.data(),
++                                             nextBodySize ) != nextBodySize )
++                    {
++                        receiveFailed = true;
++                        break;
++                    }
++
++                    messageBodySize = nextBodySize;
++                    skippedFrames_.fetch_add( 1 );
++                    numDrainedThisPass++;
++                }
++                if ( receiveFailed )
++                { break; }
++            }
++
+             // 3. Parse the body
+             Record3DHeader record3DHeader;
+ 
+@@ -277,6 +345,13 @@ namespace Record3D
+ #endif
+                 return numTotalReceivedBytes;
+             }
++            // Zero bytes after usbmuxd's internal 5 s timeout. At the start of a read that
++            // is legal idling between frames; MID-buffer it means the peer stalled without
++            // closing -- returning short (a failure to the callers) beats looping forever.
++            if ( numActuallyReceivedBytes == 0 && numTotalReceivedBytes > 0 )
++            {
++                return numTotalReceivedBytes;
++            }
+             numTotalReceivedBytes += numActuallyReceivedBytes;
+         }
+ 

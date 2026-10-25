@@ -1,45 +1,9 @@
 #!/usr/bin/env python3
-"""Wrist ZED-M publisher: stereo RGB (optionally depth) via SDK → Zenoh.
+"""Publish wrist ZED RGB, optional stereo/depth, calibration, and clock services.
 
-Publishes the streams consumed by ``scripts/wbc_vr_robot.py``. ``dexsensor``'s
-``usb_camera`` driver gives raw V4L2 only (and
-tears frames); the ZED SDK's ``grab()`` is integrity-checked, so this script
-bypasses dexsensor and publishes directly.
-
-  pyzed (owns the selected camera)
-     │
-     ├─ grab → LEFT view + RIGHT view  (+ depth only if --enable-depth)
-     │
-     ├─ publisher → sensors/<id>/left_rgb   (RGBImageCodec, RGB uint8)
-     ├─ publisher → sensors/<id>/right_rgb  (RGBImageCodec, RGB uint8)
-     ├─ publisher → sensors/<id>/depth      (DepthImageCodec)   [opt-in]
-     ├─ service   → sensors/<id>/info       (JsonDataCodec)
-     └─ service   → sensors/<id>/clock      (JsonDataCodec, publisher host clock)
-
-Topic naming matches the head_camera convention (left_rgb / right_rgb /
-depth) so dexcontrol's ``ZedCameraSensor`` subscribes to wrist streams the
-same way it does head streams.
-
-RGB-only by default: the recorder uses wrist RGB only, and the NEURAL
-stereo matcher + 1.8 MB depth frames throttle the capture loop hard. Run with
-``--enable-depth`` only when you actually need depth.
-
-This is a long-running dependency, *not* a one-shot test — start it and leave
-it running for the whole recording session (no ``--duration``).
-
-Important: only one process can hold the V4L2 device. Stop
-``dexsensor launch ... --sensor wrist_zedm`` before running.
-
-Usage::
-
-    # production: one process per wrist camera, run until Ctrl-C, RGB-only.
-    python scripts/publish_wrist_camera.py --sensor-id left_wrist_zedm \
-        --serial-number <LEFT_WRIST_SERIAL>
-    python scripts/publish_wrist_camera.py --sensor-id right_wrist_zedm \
-        --serial-number <RIGHT_WRIST_SERIAL>
-    # debug round-trip fps / depth
-    python scripts/publish_wrist_camera.py --sensor-id left_wrist_zedm \
-        --serial-number <LEFT_WRIST_SERIAL> --verify --enable-depth
+The ZED SDK owns the selected camera and validates capture before publication.
+RGB-only is the default; enable depth or the right eye when needed. Stop other
+drivers using the camera before starting this long-running publisher.
 """
 
 from __future__ import annotations

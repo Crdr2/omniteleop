@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Consume the mount-rigid iPhone's measured base pose over Zenoh.
+
+scripts/base_tracking/base_pose_pub.py publishes session-world poses after
+phone-to-base calibration. The tracker exposes an odometry-compatible interface
+and re-zeros planar pose at engage. Staleness is reported; relocalization latches
+until reset_origin(). ARKit can drift and requires a validated rigid mount.
+
+Publisher timestamps mark USB-host callbacks, not phone acquisition. Raw packets
+and local receive times are retained for offline analysis.
+"""
+
+from __future__ import annotations
+
+import copy
+import threading
+import time
+from typing import Optional
+
+import numpy as np
+from dexcomm import Node
+from dexcomm.codecs import DictDataCodec
+
+TOPIC = "tracking/base_pose"
+
+
+def _wrap(a: float) -> float:
+    """Wrap an angle to [-pi, pi)."""
+    return float((a + np.pi) % (2 * np.pi) - np.pi)
+
+
+class ARKitBaseTracker:
+    """Latest iPhone-tracked base pose, re-zeroed at engage like the wheel odometry.
+
+    ``namespace`` is the robot's Zenoh namespace (``$ROBOT_NAME``, e.g.
+    ``dm/<robot-id>``) -- the publisher uses the robot namespace, so its topic lives under
+    the ROBOT namespace, not the leader/follower one.
+    """
+
+    def __init__(self, namespace: str, *, name: str = "wbc_vr_arkit", event_sink=None) -> None:
+        if not namespace:
+            raise ValueError(
+                "ARKitBaseTracker needs the robot's Zenoh namespace (export ROBOT_NAME)"
+            )
+        self._event_sink = event_sink
+        self._raw = None
+        self._callback_wall_ns = 0
+        self._callback_monotonic_ns = 0
+        self.topic = f"{namespace}/{TOPIC}"
+        self._lock = threading.Lock()
+        self._world = np.full(3, np.nan)  # (x, y, yaw) in the ARKit session world
+        self._jumps = -1  # publisher's cumulative jump count
+        self._rp = np.full(2, np.nan)  # base roll/pitch (gravity-aligned world)
+        self._seq = -1
+        self._update_t = 0.0
+        self._origin: Optional[np.ndarray] = None
+        self._origin_jumps = 0
+        self.node = Node(name=name, namespace=namespace)
+        self.sub = self.node.create_subscriber(TOPIC, self._on_msg, decoder=DictDataCodec.decode)
+
+    def _on_msg(self, msg: dict) -> None:
+        wall_ns, mono_ns = time.time_ns(), time.monotonic_ns()
+        try:
+            planar = np.asarray(msg["planar"], dtype=np.float64)
+            rp = np.asarray(msg["rp_rad"], dtype=np.float64)
+            seq, jumps = int(msg["seq"]), int(msg["jumps"])
+        except (KeyError, TypeError, ValueError):
+            return  # ignore malformed frames
+        if (
+            planar.shape != (3,)
+            or rp.shape != (2,)
+            or not np.all(np.isfinite(planar))
+            or not np.all(np.isfinite(rp))
+        ):
+            return
+        with self._lock:
+            self._world, self._rp = planar, rp
+            self._seq, self._jumps = seq, jumps
+            self._update_t = time.perf_counter()
+            self._raw = copy.deepcopy(msg)
+            self._callback_wall_ns, self._callback_monotonic_ns = wall_ns, mono_ns
+        if self._event_sink is not None:
+            self._event_sink(
+                "arkit", dict(raw=msg, receive_wall_ns=wall_ns, receive_monotonic_ns=mono_ns)
+            )
+
+    def wait_first(self, timeout: float) -> bool:
+        """Block until the first pose arrives (True) or ``timeout`` elapses (False)."""
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            with self._lock:
+                if self._seq >= 0:
+                    return True
+            time.sleep(0.05)
+        return False
+
+    def _rel(self, world: np.ndarray, origin: Optional[np.ndarray]) -> np.ndarray:
+        if origin is None or not np.all(np.isfinite(world)):
+            return np.full(3, np.nan)
+        d = world[:2] - origin[:2]
+        c, s = np.cos(-origin[2]), np.sin(-origin[2])
+        return np.array([c * d[0] - s * d[1], s * d[0] + c * d[1], _wrap(world[2] - origin[2])])
+
+    @property
+    def pose(self) -> np.ndarray:
+        """Base pose ``(x, y, yaw)`` in the engage-origin frame (NaN before the origin)."""
+        with self._lock:
+            return self._rel(self._world, self._origin)
+
+    @property
+    def world_pose(self) -> np.ndarray:
+        """Base pose ``(x, y, yaw)`` in the ARKit session world -- unbroken across engages."""
+        with self._lock:
+            return self._world.copy()
+
+    @property
+    def age(self) -> float:
+        """Seconds since the last accepted sample (inf before the first)."""
+        with self._lock:
+            return time.perf_counter() - self._update_t if self._update_t else float("inf")
+
+    @property
+    def has_origin(self) -> bool:
+        """True once :meth:`reset_origin` has captured an engage origin."""
+        with self._lock:
+            return self._origin is not None
+
+    @property
+    def jumped(self) -> bool:
+        """True if ARKit relocalized since the origin was captured (cleared by a re-zero)."""
+        with self._lock:
+            return self._origin is not None and self._jumps > self._origin_jumps
+
+    def snapshot(self) -> dict:
+        """Atomic copy of the tracker state (engage-origin + world pose, age, health).
+
+        Taken under the lock so the pose a control tick uses and the health logged
+        beside it come from the SAME sample.
+        """
+        with self._lock:
+            age = (time.perf_counter() - self._update_t) if self._update_t else float("inf")
+            return {
+                "pose": self._rel(self._world, self._origin),
+                "world_pose": self._world.copy(),
+                "rp": self._rp.copy(),
+                "age": age,
+                "seq": int(self._seq),
+                "jumps": int(self._jumps),
+                "jumped": self._origin is not None and self._jumps > self._origin_jumps,
+                "has_origin": self._origin is not None,
+            }
+
+    def recording_context(self) -> dict:
+        """Stable origin and timestamp provenance; excludes NaN pre-origin snapshots."""
+        with self._lock:
+            return dict(
+                origin=None if self._origin is None else self._origin.tolist(),
+                origin_jumps=self._origin_jumps,
+                topic=self.topic,
+                source_stamp="t_ns: robot-host callback after USB; acquisition latency unmeasured",
+                latest_raw=copy.deepcopy(self._raw),
+            )
+
+    def reset_origin(self) -> bool:
+        """Re-zero on the latest sample -- called on the engage edge, like the odometry.
+
+        Returns False (leaving :attr:`pose` NaN and :attr:`has_origin` False) when there
+        is no sample to zero on, rather than inventing an origin.
+        """
+        with self._lock:
+            if self._seq < 0 or not np.all(np.isfinite(self._world)):
+                self._origin = None
+                return False
+            self._origin = self._world.copy()
+            self._origin_jumps = self._jumps
+            return True
+
+    def close(self) -> None:
+        """Close the Zenoh node (best-effort; dexcomm builds differ on close vs shutdown)."""
+        try:
+            close = getattr(self.node, "close", None) or getattr(self.node, "shutdown", None)
+            if close is not None:
+                close()
+        except Exception:
+            pass

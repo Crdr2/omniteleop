@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
-"""Publish Quest 3 hand and headset targets for the whole-body robot follower.
+"""Publish calibrated Quest hand/head targets and serve the WebXR headset client.
 
-The leader serves a WebXR client, calibrates the VR room against the IK model's nominal
-posture, and publishes Cartesian targets on ``vr/joints``. Position uses a yaw-aligned
-head-relative mapping so coordinated head/hand turns remain centered in the camera while
-head-only look-around leaves the hands planted. Orientation tracks each controller with
-a persistent controller-to-gripper offset created by ``--calibrate-ee-offset``.
-
-Head and hand calibration uses gravity-aligned yaw plus translation. This prevents the
-camera's nominal downward pitch from turning level room motion into false vertical motion
-or coupling headset yaw into pitch/roll. A startup blend from nominal targets prevents
-arm lunges on engage. Leader and follower load the same command rate from ``wbik.yaml``.
-
-Controls: hold right grip for one second to engage; use index triggers for grippers; X
-ends the take and returns to the safe static stage; left index while static requests
-homing; Y exits. Whole-body base motion is derived from Cartesian targets by the follower.
+Use HTTPS for LAN connections, or USB forwarding with localhost. Hold right grip
+to engage; index triggers command grippers; X ends a take; left index homes while
+idle; Y exits. Controller orientation calibration is stored outside version control.
 """
 
 from __future__ import annotations
@@ -45,8 +34,10 @@ from omniteleop.leader import wbc_headset_hud as _wbc_headset_hud
 from omniteleop.leader.communication.webxr_vr_reader import WebXRVRReader
 from omniteleop.leader.wbc_headset_hud import (
     _DEFAULT_HUD_CAMERAS,
+    HUD_RGB_CAMERAS,
     HandAlignmentStatus,
     WBCHeadsetHUD,
+    order_hud_cameras,
 )
 from omniteleop.leader.wbc_reference_alignment import (
     REFERENCE_ALIGN_HEAD_POS_TOL_MM,
@@ -60,12 +51,15 @@ from omniteleop.leader.wbc_reference_alignment import (
 )
 from omniteleop.wbc_teleop import VRTeleopConfig
 
-# Command publish rate and the Vega URDF come from follower/wbik.yaml.
+# Command publish rate and thumbstick mapping come solely from follower/wbik.yaml (no CLI
+# flags). The Vega URDF likewise comes from
+# WBCConfig (wbik.yaml urdf_path).
 _VR_TELEOP = VRTeleopConfig.from_yaml()
 DEFAULT_RATE = _VR_TELEOP.cmd_rate  # leader publish rate = follower cmd_rate (Hz)
 
 # Sentinel poses the WebXR reader emits (post-transform, in the robot frame) when a
-# controller is not tracked; hold the last good target instead of snapping to garbage.
+# controller is not tracked. Copied from ``vr_reader.INVALID_{LEFT,RIGHT}_POSE`` so
+# we can hold the last good target instead of snapping to garbage.
 INVALID_LEFT_POSE = np.array(
     [[0.0, 0.0, 1.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
 )
@@ -73,7 +67,9 @@ INVALID_RIGHT_POSE = np.array(
     [[0.0, 0.0, 1.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
 )
 
-DEFAULT_EE_OFFSET_FILE = "config/ee_offset.yaml"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CERT = None
+DEFAULT_KEY = None
 _TRIGGER_PRESS = 0.7  # right grip value counted as a press
 _TRACK_ATOL = 1e-6  # tolerance for matching the untracked sentinel poses
 DEFAULT_HEADSET_HUD_RATE = 10.0
@@ -81,9 +77,9 @@ WBC_FOLLOWER_STATUS_TOPIC = "wbc/follower_status"
 _follower_status_overlay_lines = _wbc_headset_hud.follower_status_overlay_lines
 _follower_status_overlay_color = _wbc_headset_hud.follower_status_overlay_color
 
-# Per-side controller-to-gripper orientation offsets. Cartesian targets must already use
-# the robot's gripper convention before publication, so this calibration persists across
-# processes and recording sessions. A missing file uses identity offsets.
+# Persist the controller-to-gripper orientation convention across sessions.
+# Missing calibration means identity; the local file is ignored by Git.
+DEFAULT_EE_OFFSET_FILE = str(_REPO_ROOT / "config" / "ee_offset.yaml")
 
 
 def _to_mat(pose) -> np.ndarray:
@@ -263,12 +259,12 @@ class _VRLog:
     def write(self) -> None:
         if not self._rows:
             return
-        import h5py  # noqa: PLC0415 -- optional dep, only needed at teardown
+        import h5py
 
         rows = self._rows
 
-        def col(key: str) -> np.ndarray:
-            return np.asarray([row[key] for row in rows])
+        def col(k):
+            return np.asarray([r[k] for r in rows])
 
         with h5py.File(self.path, "w") as f:
             g = f.create_group("vr")
@@ -288,19 +284,26 @@ class _VRLog:
 class WBCVRLeader:
     """Reads Quest poses, calibrates once, and streams Cartesian EEF targets."""
 
+    # Stages that stream live targets to an engaged (non-e-stop) follower, besides the
+    # pre-record "align" stage.
+    _TELEOP_STAGES: tuple[str, ...] = ("teleop",)
+
     def __init__(
         self,
         args: argparse.Namespace,
         *,
         wbc_config: Optional[WBCConfig] = None,
+        teleop_config: Optional[VRTeleopConfig] = None,
+        reference_target_frame: str = "world",
     ) -> None:
         self.rate = args.rate
         self.hold_seconds = args.hold_seconds
-        # EEF target POSITION is yaw-only HEAD-RELATIVE (see _bprime_pos): the hand rides
-        # the robot's live head-yaw frame, so a head+hands turn keeps the hands centered in
-        # the camera (the base/camera yaw follows the head) while a head-only look-around
-        # leaves them planted in the room. A startup blend (_hf_blend_dur) ramps from the
-        # nominal EE at engage so the arm does not lunge.
+        stick_cfg = _VR_TELEOP if teleop_config is None else teleop_config
+        self.stick_max_vx = stick_cfg.stick_max_vx
+        self.stick_max_vy = stick_cfg.stick_max_vy
+        self.stick_max_wz = stick_cfg.stick_max_wz
+        self.stick_deadzone = stick_cfg.stick_deadzone
+        # Map hand position in the live head-yaw frame without coupling head-only motion.
         self._hf_offset_left = np.zeros(3)
         self._hf_offset_right = np.zeros(3)
         self._hf_engage_t: Optional[float] = None
@@ -333,14 +336,12 @@ class WBCVRLeader:
         self._follower_status: Optional[WBCFollowerStatus] = None
         self._follower_status_t: Optional[float] = None
         self._status_lock = threading.Lock()
+        self._scenediff_request_id = ""
+        self._scenediff_ready = False
+        self._trigger_requires_release = False
 
-        # Calibration reference head pose, from the whole-body IK model's *nominal*
-        # posture (NOT the legacy INIT_JOINT constants). At nominal the planar base
-        # is at the world origin, so frame_pose() values are already in the base
-        # frame, matching the follower's VegaWholeBodyIK reference.
-        # The base VR entry point passes no override, preserving its canonical-config
-        # behavior. Specialized subclasses may pass the exact config they already loaded
-        # so nominal FK and follower control cannot come from different files.
+        # Anchor calibration to the IK model's nominal head FK so both processes
+        # use the same posture and frame conventions.
         cfg = WBCConfig() if wbc_config is None else wbc_config
         ik = VegaWholeBodyIK(cfg)
         ik.reset()
@@ -354,7 +355,11 @@ class WBCVRLeader:
         self._align_gate: Optional[ReferenceAlignmentGate] = None
         self._last_alignment_status: Optional[HandAlignmentStatus] = None
         if self._align_reference_path is not None:
-            ref = load_reference_ee_poses(self._align_reference_path, ik)
+            ref = load_reference_ee_poses(
+                self._align_reference_path,
+                ik,
+                target_frame=reference_target_frame,
+            )
             assert ref is not None
             # Gate the head against the NOMINAL head pose (self.T_base_head, the WBC nominal
             # posture head FK in the base frame) so an episode only starts once the operator
@@ -364,7 +369,8 @@ class WBCVRLeader:
             print(
                 "[wbc_vr_leader] alignment reference loaded from "
                 f"{self._align_reference_path} "
-                f"(pos_tol={REFERENCE_ALIGN_POS_TOL_MM:g}mm, "
+                f"({reference_target_frame} target frame, "
+                f"pos_tol={REFERENCE_ALIGN_POS_TOL_MM:g}mm, "
                 f"rot_tol={REFERENCE_ALIGN_ROT_TOL_DEG:g}deg, "
                 f"head_pos_tol={REFERENCE_ALIGN_HEAD_POS_TOL_MM:g}mm, "
                 f"head_rot_tol={REFERENCE_ALIGN_HEAD_ROT_TOL_DEG:g}deg, "
@@ -382,22 +388,20 @@ class WBCVRLeader:
             ssl_keyfile=args.key,
         )
         self._hud: Optional[WBCHeadsetHUD] = (
-            WBCHeadsetHUD(self.quest, args.hud_cameras) if args.headset_hud else None
+            WBCHeadsetHUD(
+                self.quest,
+                args.hud_cameras,
+                sim_namespace=getattr(args, "sim_camera_namespace", None),
+                center_camera=getattr(args, "hud_center_camera", None),
+            )
+            if args.headset_hud
+            else None
         )
         self._hud_period = 1.0 / float(args.hud_rate) if args.hud_rate > 0.0 else float("inf")
         self._hud_rate = float(args.hud_rate)
 
-        # ── Zenoh node + publisher: created AFTER the HUD, ON PURPOSE. ─────────────
-        # The HUD builds its own dexcontrol ``Robot`` for the camera streams. If that
-        # construction fails (robot unreachable, a wrist publisher not running, ...),
-        # the half-built Robot is garbage-collected and its ``__del__`` calls
-        # ``Robot.shutdown()`` -> ``dexcomm.cleanup_session()``, which closes the
-        # PROCESS-WIDE shared Zenoh session. The HUD swallows its own failure, so any
-        # publisher created BEFORE this point silently becomes dead and the first
-        # publish in run() dies with "Zenoh error: Publisher is closed" -- far from the
-        # real cause. Creating the node here means we always get a live session,
-        # whether or not the HUD tore the previous one down.
-        # Do not move this block back above the HUD.
+        # Create the command node after HUD setup: its Robot owns the active Zenoh
+        # session, so publishers must bind to that session after initialization.
         self.node = Node(name="wbc_vr_leader", namespace=args.namespace)
         config = get_config()
         self.topic = config.get_topic("vr_joints", "vr/joints")
@@ -427,16 +431,15 @@ class WBCVRLeader:
         self._vrlog: Optional[_VRLog] = None
         debug_vr = getattr(args, "debug_vr", None)
         if debug_vr:
-            import datetime  # noqa: PLC0415
-            import os  # noqa: PLC0415
+            import datetime
+            import os
 
             os.makedirs(debug_vr, exist_ok=True)
             stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             self._vrlog = _VRLog(os.path.join(debug_vr, f"vr_raw_{stamp}.hdf5"))
             print(f"[wbc_vr_leader] RAW-VR debug log -> {self._vrlog.path}")
 
-    # -- helpers ----------------------------------------------------------------
-
+    # helpers
     def _on_follower_status(self, data: dict) -> None:
         try:
             status = WBCFollowerStatus(**data)
@@ -467,14 +470,30 @@ class WBCVRLeader:
         val = float(transforms["right_hand_trigger"])
         now = time.perf_counter()
         if val > _TRIGGER_PRESS:
+            if getattr(self, "_trigger_requires_release", False):
+                return False
             if self._trigger_start is None:
                 self._trigger_start = now
             elif now - self._trigger_start >= self.hold_seconds:
                 self._trigger_start = None
+                self._trigger_requires_release = True
                 return True
         else:
             self._trigger_start = None
+            self._trigger_requires_release = False
         return False
+
+    def _thumbstick_to_chassis(self, transforms) -> tuple[float, float, float]:
+        def dz(v: float) -> float:
+            return v if abs(v) > self.stick_deadzone else 0.0
+
+        left = transforms["left_thumbstick"]
+        right = transforms["right_thumbstick"]
+        # Quest stick y is negative when pushed up -> negate so forward is positive.
+        vx = -dz(left[1]) * self.stick_max_vx
+        vy = -dz(left[0]) * self.stick_max_vy
+        wz = -dz(right[0]) * self.stick_max_wz
+        return vx, vy, wz
 
     def _calibrate(self, headset_pose: np.ndarray) -> None:
         """Anchor room-to-base transforms so the headset maps onto the nominal head."""
@@ -482,35 +501,16 @@ class WBCVRLeader:
         if headset_pose.shape != (4, 4):
             raise ValueError(f"headset pose has shape {headset_pose.shape}, expected (4, 4)")
         self.robot_base_t_vr_base_eef = _gravity_aligned_calibration(self.T_base_head, headset_pose)
-        # Head orientation rides the SAME gravity-aligned yaw R_yaw as the position/EEF
-        # map (so operator yaw about gravity stays a pure camera yaw -- no tilted-axis
-        # cone), plus a constant body offset C_head that re-labels the calibration
-        # headset orientation onto the nominal zed_depth_frame. Then
-        #   head_R = R_yaw @ vr_head_R @ C_head,
-        # and at calibration R_yaw @ vr_calib_R @ C_head == T_base_head (the camera
-        # starts at the nominal -45 deg down-look). Mirrors the EEF C-offset structure.
+        # Use gravity-aligned yaw plus a fixed C_head offset:
+        # head_R = R_yaw @ vr_head_R @ C_head; calibration starts at nominal head FK.
         r_yaw = self.robot_base_t_vr_base_eef[:3, :3]
         self._head_ori_offset = (r_yaw @ headset_pose[:3, :3]).T @ self.T_base_head[:3, :3]
 
     def _map_head_target(self, vr_head: np.ndarray) -> np.ndarray:
-        """Calibrated head target: the headset pose mapped into the robot base frame.
+        """Map headset position and orientation through the gravity-aligned room frame.
 
-        Both orientation and position ride the gravity-aligned room calibration
-        ``robot_base_t_vr_base_eef`` (yaw + translation), so neither couples gravity
-        into the wrong axis:
-
-          * POSITION: ``head_mode: "ik"`` makes this translation a real whole-body
-            target; mapping it through the downward-pitched optical frame would turn a
-            horizontal headset move into a height command.
-          * ORIENTATION: ``head_R = R_yaw @ vr_head_R @ C_head``. Because ``R_yaw`` is a
-            pure gravity yaw, an operator yaw about gravity stays a pure CAMERA yaw. The
-            earlier full-frame map (``robot_base_t_vr_base @ vr_head``) instead rotated
-            the camera about the optical frame's ~45-deg-down axis, so a yaw-only head
-            turn swept a cone and leaked ~100 deg of pitch/roll. ``C_head`` (captured in
-            _calibrate) is constant, so it preserves that no-coupling property while
-            re-anchoring the start at the nominal down-look.
-
-        At the calibration instant the pose equals the nominal head FK by construction.
+        Yaw-only room calibration prevents pitch/gravity coupling. The constant C_head
+        orientation offset makes the calibration pose equal the nominal head FK.
         """
         assert self._head_ori_offset is not None
         assert self.robot_base_t_vr_base_eef is not None
@@ -541,7 +541,7 @@ class WBCVRLeader:
         rotates with the head, so ``pos_base`` stays world-fixed -> PLANTED. Using the
         FULL head pose instead (``head_target @ inv(vr_head) @ vr_now``) re-introduces the
         camera pitch/relabel and swings the arm with the gaze, which is why only the yaw is
-        transferred.
+        transferred (verified offline, scripts/diagnostics/analyze_vr_hand_rel_head.py).
         """
         yaw_room = _heading_yaw(vr_head)
         yaw_base = _heading_yaw(head_target)
@@ -582,32 +582,12 @@ class WBCVRLeader:
         head_target: Optional[np.ndarray] = None,
         now: float = 0.0,
     ) -> np.ndarray:
-        """Map one controller pose to its base-frame EEF target.
+        """Map a tracked controller to its base-frame EEF target.
 
-        ``side`` (``"left"``/``"right"``) selects the per-arm nominal EE pose and engage
-        offset. Requires valid head geometry (``vr_head`` + ``head_target``).
-
-        POSITION is yaw-only head-relative (``_bprime_pos``): the hand rides the robot's
-        live head-yaw frame, so a head+hands turn keeps the hands centered in the camera
-        while a head-only look-around leaves them planted. ``_bprime_pos`` is absolute-style
-        (it places the hand at the operator's actual hand-rel-head pose), so at engage it
-        sits ~10-20 cm off ``nominal_ee``; the per-side engage offset ``_hf_offset_*`` is
-        ramped to zero over ``_hf_blend_dur`` so the arm does not lunge (a transient that
-        decays, leaving the steady map exactly B').
-
-        ORIENTATION is ``R_yaw @ vr_now_rot @ C`` (``R_yaw = robot_base_t_vr_base_eef``):
-        it tracks the operator's actual hand orientation -- which they servo by sight -- so
-        a large wrist rotation does NOT drive the arm into joint limits. A purely relative
-        orientation (``nominal_ee_rot @ vr0_rot.T @ vr_now_rot``) contorts the wrist on
-        large rolls.
-
-        The fixed per-side offset ``C`` (``self._ee_offset_left``/``_right``; identity unless
-        ``--calibrate-ee-offset`` wrote a file) is right-multiplied onto the orientation. It
-        is a constant body-frame re-labeling of the controller axes onto the gripper, so the
-        operator's neutral grip reads as the nominal ``L_ee``/``R_ee`` frame (x:down, y:left,
-        z:forward). Being CONSTANT it preserves the non-contorting property; recomputing
-        ``C`` from the engage pose each frame would instead reproduce the rejected relative
-        orientation (deviation tied to rotation-since-engage).
+        Position uses the gravity-aligned head-relative map; a decaying engage offset
+        blends from nominal without a lunge. Requires valid vr_head and head_target.
+        Orientation is R_yaw @ controller_rotation @ C, where C is the fixed per-side
+        controller-to-gripper calibration. Do not recompute C from the engage pose.
         """
         if vr_head is None or head_target is None:
             raise ValueError("_eef_target requires vr_head and head_target")
@@ -663,6 +643,7 @@ class WBCVRLeader:
         head_target: Optional[np.ndarray],
         left_gripper: float,
         right_gripper: float,
+        chassis: tuple[float, float, float],
         *,
         exit_requested: bool = False,
         home_requested: bool = False,
@@ -672,20 +653,57 @@ class WBCVRLeader:
         head_flat = head_target.reshape(-1).tolist() if head_target is not None else []
         data = VRJointData(
             timestamp_ns=time.time_ns(),
+            head_pos=[],
+            left_arm_pos=[],
+            right_arm_pos=[],
             left_gripper=float(left_gripper),
             right_gripper=float(right_gripper),
-            estop=(self.stage == "static"),
+            chassis_vx=float(chassis[0]),
+            chassis_vy=float(chassis[1]),
+            chassis_wz=float(chassis[2]),
+            estop=(self.stage not in ("align", *getattr(self, "_TELEOP_STAGES", ("teleop",)))),
             exit_requested=bool(exit_requested),
             home_requested=bool(home_requested),
             calib_stage=self.stage,
+            scenediff_request_id=getattr(self, "_scenediff_request_id", ""),
             left_ee_pose=left_flat,
             right_ee_pose=right_flat,
             head_ee_pose=head_flat,
+            **getattr(self, "_extra_publish_fields", dict)(),
         )
-        # Publisher was created with encoder=DictDataCodec.encode, so pass a plain dict.
+        # Publisher was created with encoder=DictDataCodec.encode, so pass the
+        # plain dict and let it encode (mirrors vr_reader._publish).
         self.pub.publish(asdict(data))
 
-    # -- main loop --------------------------------------------------------------
+    def _extra_publish_fields(self) -> dict:
+        """VRJointData fields a leader variant adds to every command (none here)."""
+        return {}
+
+    # main loop
+    def _handle_episode_buttons(self, transforms) -> bool:
+        """Left X: end the current episode and return to ``static`` (e-stop).
+
+        Runs every tick after the left-Y stop check. Returns True when the press consumed
+        the tick, so the caller skips this tick's stage logic.
+        """
+        x_now = bool(transforms["left_x_button"])
+        pressed = _button_rising_edge(now=x_now, prev=self._prev_x)
+        self._prev_x = x_now
+        if not pressed:
+            return False
+        self.stage = "static"
+        self.robot_base_t_vr_base_eef = None
+        self._head_ori_offset = None
+        self.last_left_target = None
+        self.last_right_target = None
+        self._trigger_start = None
+        self._last_alignment_status = None
+        self._scenediff_request_id = ""
+        self._scenediff_ready = False
+        self._trigger_requires_release = True
+        self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
+        print("\n[wbc_vr_leader] episode ended -> static.")
+        return True
 
     def run(self) -> None:
         """Main loop: poll the Quest, calibrate on a grip-hold, then stream EEF targets."""
@@ -716,10 +734,20 @@ class WBCVRLeader:
                     time.sleep(dt)
                     continue
 
+                status, age = self._follower_status_snapshot()
+                if (
+                    status is not None
+                    and age is not None
+                    and age < 1.0
+                    and status.home_required
+                    and self.stage in ("align", *self._TELEOP_STAGES)
+                ):
+                    self.stage = "static"
+                    self._scenediff_ready = False
+
                 # left Y -> publish one final exit frame so followers stop/save/exit.
-                # left X -> end the current episode and return to static/e-stop.
+                # left X -> end the current episode (_handle_episode_buttons).
                 # left trigger in static -> request follower homing to nominal.
-                x_now = bool(transforms["left_x_button"])
                 y_now = bool(transforms["left_y_button"])
                 left_trigger_home_now = (
                     self.stage == "static"
@@ -736,6 +764,7 @@ class WBCVRLeader:
                         None,
                         transforms["left_index_trigger"],
                         transforms["right_index_trigger"],
+                        self._thumbstick_to_chassis(transforms),
                         exit_requested=True,
                     )
                     print("\n[wbc_vr_leader] terminal stop requested (left Y).")
@@ -751,31 +780,23 @@ class WBCVRLeader:
                     break
                 self._prev_y = y_now
 
-                if _button_rising_edge(now=x_now, prev=self._prev_x):
-                    self._prev_x = x_now
-                    self.stage = "static"
-                    self.robot_base_t_vr_base_eef = None
-                    self._head_ori_offset = None
-                    self.last_left_target = None
-                    self.last_right_target = None
-                    self._trigger_start = None
-                    self._last_alignment_status = None
-                    self._publish(None, None, None, 0.0, 0.0)
-                    print("\n[wbc_vr_leader] episode ended -> static.")
+                if self._handle_episode_buttons(transforms):
                     continue
-                self._prev_x = x_now
 
                 if _button_rising_edge(
                     now=left_trigger_home_now,
                     prev=self._prev_left_trigger_home,
                 ):
                     self._prev_left_trigger_home = left_trigger_home_now
+                    self._scenediff_request_id = ""
+                    self._scenediff_ready = False
                     self._publish(
                         None,
                         None,
                         None,
                         0.0,
                         0.0,
+                        (0.0, 0.0, 0.0),
                         home_requested=True,
                     )
                     print("\n[wbc_vr_leader] home requested (left trigger).")
@@ -795,8 +816,68 @@ class WBCVRLeader:
                 vr_l = transforms["left_wrist"]
                 vr_r = transforms["right_wrist"]
 
+                # Requests persist in every frame until acknowledged; no one-tick pulse.
+                if self.stage == "sweep":
+                    self._trigger_held(transforms)  # consume holds while busy
+                    status, age = self._follower_status_snapshot()
+                    if (
+                        status is not None
+                        and age is not None
+                        and age < 1.0
+                        and status.scenediff_request_id == self._scenediff_request_id
+                        and status.scenediff_state == "ready"
+                    ):
+                        self._scenediff_ready = True
+                        self._trigger_start = None
+                        self._trigger_requires_release = True
+                        self.stage = "static"
+                        print(
+                            "\n[wbc_vr_leader] sweep saved; RELEASE then hold RIGHT grip "
+                            "again to calibrate/align."
+                        )
+                    self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
+                    if self._hud is not None:
+                        self._hud.update_state(
+                            stage="sweep", status=status, status_age_s=age, alignment=None
+                        )
+                    time.sleep(dt)
+                    continue
+
                 if self.stage == "static":
                     if self._trigger_held(transforms):
+                        status, age = self._follower_status_snapshot()
+                        if status is None or age is None or age >= 1.0:
+                            print(
+                                "\n[wbc_vr_leader] waiting for fresh follower status; "
+                                "release and hold RIGHT grip again."
+                            )
+                            self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
+                            time.sleep(dt)
+                            continue
+                        if status.home_required:
+                            print(
+                                "\n[wbc_vr_leader] Home first: press LEFT index trigger, "
+                                "then release and hold RIGHT grip again."
+                            )
+                            self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
+                            time.sleep(dt)
+                            continue
+                        if status.scenediff_enabled and not self._scenediff_ready:
+                            self._scenediff_request_id = str(time.time_ns())
+                            self.stage = "sweep"
+                            self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
+                            print("\n[wbc_vr_leader] first hold -> park arms and stereo sweep.")
+                            time.sleep(dt)
+                            continue
+                        if self._scenediff_ready and (
+                            status.scenediff_request_id != self._scenediff_request_id
+                            or status.scenediff_state != "ready"
+                        ):
+                            self._scenediff_ready = False
+                            print(
+                                "\n[wbc_vr_leader] sweep acknowledgement lost; press again to scan."
+                            )
+                            continue
                         # Name the OFFENDING input(s). The grip-trigger hold that got us here
                         # is decoupled from the pose stream -- vr_client.html sets
                         # right_squeeze from the session squeezestart/squeezeend events, which
@@ -859,7 +940,7 @@ class WBCVRLeader:
                                     f"[{d[0]:+.3f} {d[1]:+.3f} {d[2]:+.3f}] m"
                                 )
                     if self.stage == "static":
-                        self._publish(None, None, None, 0.0, 0.0)
+                        self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
                 elif self.stage == "align":
                     head_target = (
                         self._map_head_target(transforms["head"])
@@ -883,8 +964,9 @@ class WBCVRLeader:
                         head_target,
                         transforms["left_index_trigger"],
                         transforms["right_index_trigger"],
+                        self._thumbstick_to_chassis(transforms),
                     )
-                elif self.stage == "teleop":
+                elif self.stage in self._TELEOP_STAGES:
                     # Head target FIRST: the hands are mapped relative to the live head-yaw
                     # frame, so they need head_target this tick. Hold-last-good on a
                     # malformed/NaN headset frame -> empty head target (the follower keeps
@@ -898,12 +980,14 @@ class WBCVRLeader:
                     left_target, right_target = self._map_targets(
                         vr_l, vr_r, vr_head=transforms["head"], head_target=head_target, now=now
                     )
+                    chassis = self._thumbstick_to_chassis(transforms)
                     self._publish(
                         left_target,
                         right_target,
                         head_target,
                         transforms["left_index_trigger"],
                         transforms["right_index_trigger"],
+                        chassis,
                     )
                     if self._vrlog is not None:
                         nanmat = np.full((4, 4), np.nan)
@@ -933,7 +1017,10 @@ class WBCVRLeader:
                 t = now - t0
                 if t - last_print >= 0.5:
                     last_print = t
-                    if self.stage in ("align", "teleop") and self.last_left_target is not None:
+                    if (
+                        self.stage in ("align", *self._TELEOP_STAGES)
+                        and self.last_left_target is not None
+                    ):
                         lp = self.last_left_target[:3, 3]
                         rp = self.last_right_target[:3, 3]
                         print(
@@ -963,8 +1050,7 @@ class WBCVRLeader:
                 )
             print("\n[wbc_vr_leader] stopped.")
 
-    # -- calibration helper -----------------------------------------------------
-
+    # calibration helper
     def calibrate_ee_offset(
         self, capture_seconds: float, out_file: str
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -1099,14 +1185,8 @@ def main() -> None:
     )
     parser.add_argument("--host", default="0.0.0.0", help="WebXR bind host (default 0.0.0.0).")
     parser.add_argument("--port", type=int, default=5067, help="WebXR port (default 5067).")
-    parser.add_argument(
-        "--cert",
-        default=None,
-        help="optional TLS certificate for Wi-Fi WebXR; USB/localhost needs none.",
-    )
-    parser.add_argument(
-        "--key", default=None, help="private key paired with --cert (never commit it)."
-    )
+    parser.add_argument("--cert", default=DEFAULT_CERT, help="TLS cert for the WebXR server.")
+    parser.add_argument("--key", default=DEFAULT_KEY, help="TLS key for the WebXR server.")
     parser.add_argument(
         "--hold-seconds",
         type=float,
@@ -1139,7 +1219,14 @@ def main() -> None:
         default=list(_DEFAULT_HUD_CAMERAS),
         help="camera streams to read for the headset HUD. RGB streams are "
         "shown side-by-side; head_depth is ignored in the preview to "
-        "match the recording view.",
+        "match vr_reader.py.",
+    )
+    parser.add_argument(
+        "--hud-center-camera",
+        choices=HUD_RGB_CAMERAS,
+        default=None,
+        help="RGB view to place in the middle of the headset HUD; must be "
+        "included in --hud-cameras. Default: keep --hud-cameras order.",
     )
     parser.add_argument(
         "--align-reference",
@@ -1184,11 +1271,10 @@ def main() -> None:
         "motion directly from the Quest stream. OFF by default.",
     )
     args = parser.parse_args()
-    if bool(args.cert) != bool(args.key):
-        parser.error("--cert and --key must be supplied together")
-    for flag, value in (("--cert", args.cert), ("--key", args.key)):
-        if value and not Path(value).is_file():
-            parser.error(f"{flag} file does not exist: {value}")
+    try:
+        order_hud_cameras(args.hud_cameras, args.hud_center_camera)
+    except ValueError as exc:
+        parser.error(str(exc))
     # Publish rate comes SOLELY from wbik.yaml's vr_teleop.cmd_rate (the rate the follower
     # interpolates up from), so leader and follower cannot drift; the URDF comes from
     # WBCConfig's urdf_path. Neither is a CLI flag. Bind cmd_rate onto args (the established

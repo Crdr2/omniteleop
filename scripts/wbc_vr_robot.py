@@ -1,23 +1,9 @@
 #!/usr/bin/env python3
-"""Drive and record a Dexmate Vega from the WebXR whole-body leader.
+"""Whole-body robot follower with IK, safety gating, replay, and HDF5 recording.
 
-Live mode subscribes to Cartesian hand/head targets, interpolates the command stream to
-the IK rate, applies whole-body safety gates, and sends clamped commands to the robot.
-``--replay FILE`` re-solves a recorded episode's original Cartesian targets at their
-recorded cadence; recorded head targets bypass filtering because filtering is already
-baked into the take.
-
-``--record`` starts on the first post-calibration engage and writes synchronized robot,
-gripper, head-camera, and wrist-camera data. Recording requires the complete
-``torso,arms,head,base`` enable mask and fresh timestamps from all configured cameras.
-World-frame end-effector/head targets are stored verbatim. Camera intrinsics are stored
-once, while the moving camera pose can be reconstructed from ``obs/base/pose`` and
-``obs/joint``. Publisher clock offsets are stored under ``meta/camera_ntp``.
-
-Never command the base through low-level steering or wheel-velocity APIs: opposed
-steering and velocity can damage the wheel motors. This follower routes base motion
-through ``set_velocity`` and stops motion whenever the leader, source watchdog, IK, or
-safety gate requests a hold.
+Interpolate low-rate Cartesian targets at the IK rate. Recording requires fresh,
+capture-aligned cameras and retains live calibration, timing, native-state sidecars,
+and source/config provenance. No hardware connection occurs on import.
 """
 
 from __future__ import annotations
@@ -33,10 +19,14 @@ import numpy as np
 from dexcomm.codecs import DictDataCodec, JsonDataCodec
 
 from omniteleop.common import get_config
+from omniteleop.common.camera_resolution import camera_resolution_metadata
+from omniteleop.common.native_state_recorder import record_event
 from omniteleop.common.recorder import EpisodeRecorder, peek_next_episode_id
 from omniteleop.common.schemas import WBC_FOLLOWER_STAGE_ABORTED, WBCFollowerStatus
 from omniteleop.common.streaming_recorder import StreamingEpisodeRecorder
+from omniteleop.follower.arkit_base import ARKitBaseTracker
 from omniteleop.follower.whole_body_ik import (
+    DEFAULT_CONFIG_PATH,
     HEAD_FRAME,
     LEFT_EE_FRAME,
     RIGHT_EE_FRAME,
@@ -59,8 +49,8 @@ from omniteleop.wbc_stream import (
 )
 from omniteleop.wbc_teleop import VRJointSubscriber, VRTeleopConfig, bind_vr_teleop_args
 
-# Shared VR-follower control-loop tunables, loaded from the vr_teleop: block of
-# follower/wbik.yaml so leader and follower shape the command stream identically.
+# Shared command-stream defaults come from vr_teleop in follower/wbik.yaml.
+# Hardware-specific bring-up limits remain local below.
 _VR_TELEOP = VRTeleopConfig.from_yaml()
 DEFAULT_HEAD_LPF_TAU = _VR_TELEOP.head_lpf_tau
 DEFAULT_SPEED = _VR_TELEOP.replay_speed  # --replay time scale (<1 = slower)
@@ -79,39 +69,165 @@ DEFAULT_BASE_POST_ANGULAR_DEADBAND = _VR_TELEOP.base_post_angular_deadband
 DEFAULT_STATUS_PUBLISH_RATE = 10.0
 WBC_FOLLOWER_STATUS_TOPIC = "wbc/follower_status"
 
-# Episode recording (--record). The default cadence matches the 10 Hz command stream.
+# Episode recording (--record): vr_reader EpisodeRecorder format so takes are
+# interchangeable with VR-teleop recordings. Default cadence matches vr_reader's
+# record_rate; the default dir is the same raw_data tree the leader writes to.
 DEFAULT_RECORD_RATE = 10.0
 DEFAULT_SAVE_DIR = "data/raw"
-# --record stale-frame grace: when a record tick finds no strictly-newer frame from every
-# camera, retry at the IK rate for up to this long before aborting the take. The publishers
-# hold ~15 fps through these stalls (verified against their per-second pub-fps logs), so a
-# non-newer frame means the DELIVERY path hiccupped: a WiFi burst, Zenoh backlog, or this
-# process starving its Zenoh decode threads under solver load (worst while the torso moves).
-# A frame is recorded only once BOTH publisher timestamps advance, so the no-duplicate
-# guarantee is unchanged -- the grace converts a short delivery stall into one late frame
-# instead of a dead take. 0 restores the old abort-on-first-stale-tick behavior.
-DEFAULT_RECORD_STALE_GRACE = 0.20
-# Consecutive recorded frames whose right eye could not be paired with the left before
-# disabling the per-frame pairing retry. This prevents a misconfigured publisher from
-# silently reducing the recording rate for an entire episode.
-_RIGHT_PAIR_GIVE_UP = 20
-
-# Wrist cameras (recorded under obs/images/{left,right}_wrist_rgb when --record). Like the
-# head camera they are consumed through the dexcontrol Robot API, but as multi-stream
-# ZED-Ms published by standalone ZED-SDK processes on sensors/<sensor_id>/{left_rgb,
-# right_rgb} (see scripts/publish_wrist_camera.py). RGB-only. "left"/"right" name
-# the ARM, not the stereo eye; each publisher requires an explicit serial number so USB
-# enumeration cannot swap the arm labels.
+# Saving is normally sub-second for the streaming recorder, but filesystem or writer
+# failures must not hold robot teardown forever. This is deliberately a generous
+# terminal-path deadline, not a performance target.
+_RECORDER_SAVE_TIMEOUT_S = 120.0
+# Retry transient stale-camera delivery for this interval without writing
+# duplicate rows. Zero aborts on the first stale record tick.
+DEFAULT_RECORD_STALE_GRACE = 0.25
+# Before frame zero, require multiple advancing frames from every camera
+# and at least one capture-aligned set after clearing episode histories.
+DEFAULT_RECORD_STARTUP_TIMEOUT = 3.0
+_RECORD_STARTUP_MIN_HEAD_FRAMES = 4
+_RECORD_STARTUP_MIN_WRIST_FRAMES = 3
+# Frame zero requires settled measured head joints near the last command.
+_RECORD_STARTUP_HEAD_TOL_RAD = 0.02
+_RECORD_STARTUP_HEAD_STILL_RAD = 0.002
+# Maximum corrected head-to-wrist capture skew per row. Compare stamps
+# only after mapping each publisher clock through meta/camera_ntp.
+DEFAULT_RECORD_MAX_CAMERA_SKEW_MS = 40.0
+# Maximum capture-to-selection age after mapping each publisher timestamp into the
+# recorder's local wall clock. A strictly advancing stream can still be several frames
+# behind because of encode/network/decode backlog. The deployed 30 Hz head + 15 Hz
+# wrists measured a 133 ms worst selected age at 10 Hz, so 150 ms keeps useful margin
+# without admitting the ~180 ms selected ages of the old 15 Hz head profile.
+DEFAULT_RECORD_MAX_CAMERA_AGE_MS = 150.0
+_CAMERA_FUTURE_TOLERANCE_NS = 10_000_000
+# Throttle gripper writes so they cannot starve achieved-position FC03 reads.
+# Changed commands run at <=20 Hz; unchanged commands use a slower keepalive.
+_GRIPPER_COMMAND_MAX_RATE_HZ = 20.0
+_GRIPPER_COMMAND_MIN_PERIOD_S = 1.0 / _GRIPPER_COMMAND_MAX_RATE_HZ
+_GRIPPER_COMMAND_KEEPALIVE_S = 1.0
+# Episode 7 measured healthy FC03 replies at 5.5 ms median / 7.6 ms p95, with one
+# 41.9 ms outlier. Give a read the full 75 ms transaction window before allowing an
+# FC16 write, then expire it before the next 10 Hz status slot. The old 25 ms guard +
+# 500 ms timeout let a keepalive/changed FC16 collide with a read and then blocked all
+# replacement reads for half a second.
+_GRIPPER_STATUS_REQUEST_TIMEOUT_S = 0.075
+_GRIPPER_STATUS_WRITE_GUARD_S = _GRIPPER_STATUS_REQUEST_TIMEOUT_S
+# Also keep FC16 out of the short interval immediately *before* the next scheduled
+# FC03. Without this half of the time-division contract, a 100 Hz tick could still send
+# a changed command 10 ms before the following read even though reads have same-tick
+# priority. Twenty-five milliseconds is >3x episode 7's p95 healthy transaction time.
+_GRIPPER_STATUS_PRE_READ_GUARD_S = 0.025
+_GRIPPER_STATUS_MAX_AGE_PERIODS = 2.5
+# Select against a slightly tighter limit than the persisted commit-time contract.
+# Episode 8 measured sub-millisecond state assembly, so 0.1 period (10 ms at 10 Hz)
+# comfortably covers selection -> final timestamp without weakening the offline gate.
+_GRIPPER_STATUS_COMMIT_MARGIN_PERIODS = 0.1
+# Enough history for the 250 ms stale grace plus scheduling/transport jitter. Head
+# history is essential when the low-latency head publisher runs at 30 Hz while the
+# wrists run at 15 Hz: always anchoring on the newest head frame can run ahead of the
+# later-arriving wrist frames and starve an otherwise feasible 10 Hz coherent set.
+_HEAD_ALIGNMENT_BUFFER_FRAMES = 16
+_WRIST_ALIGNMENT_BUFFER_FRAMES = 16
+# Wrist RGB streams use the ZED sensor API and retain publisher capture stamps.
 _WRIST_SENSOR_IDS: dict[str, str] = {
     "left": "left_wrist_zedm",
     "right": "right_wrist_zedm",
 }
-_WRIST_OBS_KEY = "left_rgb"  # stereo left eye -- the only stream the publishers send
+_WRIST_OBS_KEY = "left_rgb"  # established policy/recording view: stereo left eye
 _HEAD_SENSOR_ID = "head_camera"
+
+
+class _HeadAlignmentSample:
+    """One internally coherent head-cache sample with exact receive stamps."""
+
+    __slots__ = (
+        "left_rgb",
+        "depth_u16",
+        "left_capture_ns",
+        "depth_capture_ns",
+        "right_rgb",
+        "right_capture_ns",
+        "left_receive_ns",
+        "depth_receive_ns",
+        "right_receive_ns",
+    )
+
+    def __init__(
+        self,
+        *,
+        left_rgb: np.ndarray,
+        depth_u16: Optional[np.ndarray],
+        left_capture_ns: int,
+        depth_capture_ns: Optional[int],
+        right_rgb: Optional[np.ndarray],
+        right_capture_ns: Optional[int],
+        left_receive_ns: int,
+        depth_receive_ns: Optional[int],
+        right_receive_ns: Optional[int],
+    ) -> None:
+        self.left_rgb = left_rgb
+        self.depth_u16 = depth_u16
+        self.left_capture_ns = left_capture_ns
+        self.depth_capture_ns = depth_capture_ns
+        self.right_rgb = right_rgb
+        self.right_capture_ns = right_capture_ns
+        self.left_receive_ns = left_receive_ns
+        self.depth_receive_ns = depth_receive_ns
+        self.right_receive_ns = right_receive_ns
+
+    def images_tuple(self) -> tuple:
+        """Legacy ``_grab_head_images`` six-field view used by ``record_tick``."""
+        return (
+            self.left_rgb,
+            self.depth_u16,
+            self.left_capture_ns,
+            self.depth_capture_ns,
+            self.right_rgb,
+            self.right_capture_ns,
+        )
+
+
 _CAMERA_CLOCK_SAMPLE_COUNT = 15
 _CAMERA_CLOCK_MIN_SAMPLES = 8
 _CAMERA_CLOCK_TIMEOUT_S = 0.5
 _CAMERA_CLOCK_MAX_CONSECUTIVE_FAILURES = 3
+_RAW_EPISODE_SCHEMA = "omniteleop_wbc_mobile_raw/v5"
+
+
+def _json_bytes(value) -> np.ndarray:
+    """Stable UTF-8 JSON scalar accepted by both episode recorder backends."""
+    import json
+    from pathlib import Path
+
+    def default(obj):
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, (set, tuple)):
+            return list(obj)
+        raise TypeError(f"cannot JSON-encode {type(obj).__name__}")
+
+    encoded = json.dumps(
+        value,
+        default=default,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return np.asarray(encoded.encode("utf-8"))
+
+
+def _sha256_file(path) -> str:
+    """SHA-256 a small source/config file without depending on git cleanliness."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _wbc_follower_status_topic() -> str:
@@ -125,6 +241,17 @@ def _create_status_publisher(source):
     return node.create_publisher(_wbc_follower_status_topic(), encoder=DictDataCodec.encode)
 
 
+def _recorder_episode_id(driver) -> int:
+    """Episode index the driver's recorder will save next, or -1 without ``--record``.
+
+    Published in the follower status so the headset HUD can show the operator which
+    ``episode_<N>.hdf5`` the take they are about to (or currently) record lands in --
+    the recorder owns the id, and it only exists in THIS process.
+    """
+    recorder = getattr(driver, "_episode", None)
+    return -1 if recorder is None else int(getattr(recorder, "episode_id", -1))
+
+
 def _build_follower_status(
     vr,
     result,
@@ -132,6 +259,7 @@ def _build_follower_status(
     estop: bool,
     hold: bool,
     hold_reason: str,
+    episode_id: int = -1,
     timestamp_ns: Optional[int] = None,
 ) -> WBCFollowerStatus:
     """Build the lightweight status frame consumed by the WBC VR leader HUD."""
@@ -146,6 +274,7 @@ def _build_follower_status(
         safety_status=str(result.safety_status),
         left_ee_error_mm=float(result.left_ee_error) * 1000.0,
         right_ee_error_mm=float(result.right_ee_error) * 1000.0,
+        episode_id=int(episode_id),
     )
 
 
@@ -230,6 +359,21 @@ def _camera_clock_calibration_from_samples(
 # base velocity clamp, post-deadband) come from the vr_teleop: block above; only the
 # homing/joint-step/watchdog knobs live here.
 DEFAULT_MAX_JOINT_STEP = 0.05  # rad/IK-tick clamp on arm/torso/head joint commands
+# Seconds after an engage over which the leader targets are blended in from the solver's
+# anchor (nominal or the SceneDiff parked pose). Without it the first command is glided
+# over one 1/cmd_rate period, i.e. the arms cover the whole anchor-to-controller distance
+# at their velocity limit -- masked by firmware tracking lag before the arm velocity
+# feedforward, a lunge after it (joystick take 2026-09-06, second right-trigger hold).
+ENGAGE_GLIDE_S = 2.0
+# Clamp target-clock advancement per tick so a loop stall cannot skip the
+# remaining interpolation segment; withheld time is repaid gradually.
+MAX_TARGET_CLOCK_ADVANCE_TICKS = 4
+# First-order low-pass time constant (s) on the ARM joint commands at the IK rate; the
+# velocity feedforward is taken from the filtered stream. Smooths the velocity steps the
+# 10 Hz lerp'd command stream has every 1/cmd_rate, which the feedforward otherwise
+# reproduces on the hardware. Applies identically to a 10 Hz leader and a 10 Hz policy,
+# so collection and rollout execute alike. 0 disables. ~40 ms adds ~40 ms of phase lag.
+DEFAULT_ARM_CMD_LPF_TAU = 0.04
 DEFAULT_SOURCE_TIMEOUT = 0.5  # s without a fresh command / odom sample -> hold
 # rad: measured-vs-nominal gate before the first engage. Sized to tolerate normal
 # position-control steady-state droop (gravity/friction on a loaded arm joint is a few
@@ -310,6 +454,9 @@ class _TrajLog:
         "clamp_max_over",
         "odom_age",
         "odom_drive_ts_ns",
+        "joystick_axis",
+        "arkit_age",
+        "arkit_jumps",
     )
     _VECTOR_KEYS = (
         "q",
@@ -321,8 +468,12 @@ class _TrajLog:
         "odom_pose",
         "odom_steer",
         "odom_wvel",
+        "arkit_pose",
+        "arkit_world",
+        "arkit_rp",
         "rx_chassis",
         "projected_chassis",
+        "joystick_cmd_pose",
         "left_target",
         "right_target",
         "head_target",
@@ -350,7 +501,7 @@ class _TrajLog:
         """
         if self.debug_dir is None or not self._rows:
             return None
-        import os  # noqa: PLC0415
+        import os
 
         path = os.path.join(self.debug_dir, f"episode_{int(episode_id)}_debug.hdf5")
         n = len(self._rows)
@@ -367,12 +518,12 @@ class _TrajLog:
         strings) plus ``meta`` in its attrs. Columns absent this run (no driver) are
         skipped rather than erroring.
         """
-        import h5py  # noqa: PLC0415 -- optional dep, only needed at flush
+        import h5py
 
         rows = self._rows
 
-        def col(key: str) -> np.ndarray:
-            return np.asarray([row[key] for row in rows])
+        def col(k):
+            return np.asarray([r[k] for r in rows])
 
         with h5py.File(path, "w") as f:
             g = f.create_group("debug")
@@ -408,7 +559,7 @@ class OdometryThread:
     """
 
     def __init__(self, robot, drive_state_mode: str = "ms", rate: float = 200.0) -> None:
-        from omniteleop.follower.swerve_odometry import (  # noqa: PLC0415
+        from omniteleop.follower.swerve_odometry import (
             OdometryInputError,
             SwerveOdometry,
         )
@@ -501,6 +652,7 @@ class OdometryThread:
             age = (time.perf_counter() - self._update_t) if self._update_t else float("inf")
             return {
                 "pose": self._pose.copy(),
+                "twist": self._twist.copy(),
                 "age": age,
                 "steer": self._steer.copy(),
                 "wvel": self._wvel.copy(),
@@ -525,6 +677,33 @@ class OdometryThread:
         self._thread.join(timeout=1.0)
 
 
+def _wait_for_recorder_save(
+    recorder,
+    *,
+    path: str,
+    timeout_s: float = _RECORDER_SAVE_TIMEOUT_S,
+) -> None:
+    """Wait for async finalization without allowing teardown to spin forever."""
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while recorder.saving:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            message = (
+                "[wbc_vr_robot] recorder did not finish within "
+                f"{float(timeout_s):g}s for {path}; refusing to wait forever. "
+                "Treat any .partial file as quarantined and inspect the save target."
+            )
+            invalidate = getattr(recorder, "invalidate_save", None)
+            if callable(invalidate):
+                invalidate(message)
+            # The writer may have completed between the loop condition and the
+            # invalidation lock. In that case there is no timeout left to report.
+            if not recorder.saving:
+                return
+            raise TimeoutError(message)
+        time.sleep(min(0.05, remaining))
+
+
 class HardwareDriver:
     """Drive the real Vega (``dexcontrol.robot.Robot``) from the IK result.
 
@@ -547,16 +726,16 @@ class HardwareDriver:
         enable: dict,
         traj: Optional[_TrajLog] = None,
     ) -> None:
-        from dexbot_utils import RobotInfo  # noqa: PLC0415 -- hardware-only deps, lazy
-        from dexcontrol.robot import Robot  # noqa: PLC0415
+        from dexbot_utils import RobotInfo
+        from dexcontrol.robot import Robot
 
-        from omniteleop.follower import base_closed_loop as base_cl  # noqa: PLC0415
-        from omniteleop.follower.robotiq import (  # noqa: PLC0415
+        from omniteleop.follower import base_closed_loop as base_cl
+        from omniteleop.follower.robotiq import (
             build_hande_command,
             send_activate,
             send_ee_pass_through_with_timestamps,
         )
-        from omniteleop.follower.whole_body_ik import (  # noqa: PLC0415
+        from omniteleop.follower.whole_body_ik import (
             HEAD_JOINTS,
             LEFT_ARM_JOINTS,
             RIGHT_ARM_JOINTS,
@@ -565,9 +744,12 @@ class HardwareDriver:
 
         self.args = args
         self.ik = ik
+        self._gripper_collision_feedback = bool(
+            getattr(getattr(ik, "config", None), "enable_collision_avoidance", False)
+        )
         self.cfg = cfg
         self.enable = enable
-        # A take needs post-clamp sent joints for every group (action/joint/*)
+        # A policy take needs post-clamp sent joints for EVERY group (action/joint/*)
         # and odometry (obs/base/pose anchors the world-frame action targets), so
         # --record only makes sense with the full actuation mask. Fail fast here,
         # before any hardware connection, not on the first recorded frame.
@@ -593,7 +775,11 @@ class HardwareDriver:
         # through init (e.g. a failed homing gate) can still tear down cleanly.
         self.robot = None
         self._odom: Optional[OdometryThread] = None
+        self._arkit: Optional[ARKitBaseTracker] = None
+        self._world_frame_epoch = 0
         self._episode: Optional[EpisodeRecorder | StreamingEpisodeRecorder] = None
+        self._camera_motion_recorder = None
+        self._native_state_recorder = None
         # Optional per-tick /debug log (passed by _run_ik_mode when --debug-dir is set).
         # stop_recording_episode() flushes it once per saved episode so RAM stays bounded.
         self._traj: Optional[_TrajLog] = traj
@@ -608,7 +794,14 @@ class HardwareDriver:
         # steering-hold-vs-recenter decision (base_quiet_dispatch). Reset on engage/hold.
         self._base_quiet_elapsed = 0.0
         self._prev_cmd: dict = {grp: None for grp in self._joint_names}
+        # Filtered arm command stream (None = re-seed on the next non-hold tick).
+        self._arm_filt: dict = {"left_arm": None, "right_arm": None}
         self._overstep_ticks = 0
+        # Wall-clock bracket around the most recent hardware command dispatch. A
+        # scalar frame timestamp cannot say whether an action preceded or followed
+        # the camera/state sample; record_tick persists this bracket per saved row.
+        self._last_action_dispatch_start_wall_ns = -1
+        self._last_action_dispatch_end_wall_ns = -1
         # Per-tick /debug scratch: measured_q / actuate / _drive_base stash their
         # intermediates here and debug_row() assembles them after actuation. Touched
         # only by the (single-threaded) follower loop.
@@ -619,9 +812,38 @@ class HardwareDriver:
         # if init fails partway.
         self._last_gripper_cmd_left = 0.0
         self._last_gripper_cmd_right = 0.0
+        self._last_gripper_wire_message: dict[str, Optional[bytes]] = {
+            "left": None,
+            "right": None,
+        }
+        self._last_gripper_wire_send_monotonic = {
+            "left": float("-inf"),
+            "right": float("-inf"),
+        }
+        self._last_gripper_wire_change_monotonic = dict(self._last_gripper_wire_send_monotonic)
+        # FC03 reads and FC16 commands share one Modbus pass-through per arm. Status
+        # reads are scheduled at the record cadence from the 100 Hz actuation loop and
+        # always serviced before a possible command write on that tick.
+        self._next_grip_status_request_monotonic = {
+            "left": 0.0,
+            "right": 0.0,
+        }
         self._last_obs_grip_left = float("nan")
         self._last_obs_grip_right = float("nan")
         self._grip_monitors: dict = {}
+        # A cached value alone is not evidence that gripper feedback is current. Keep
+        # the complete latest FC03 event and a monotonically increasing event count per
+        # arm. A saved row may zero-order-hold that event only inside the explicit
+        # timestamp-age bound; this preserves the 10 Hz image/action grid across one
+        # dropped Modbus reply without recreating episode_2's unbounded 481-row repeat.
+        self._last_grip_status: dict[str, Optional[dict]] = {
+            "left": None,
+            "right": None,
+        }
+        self._grip_status_event_count = {"left": 0, "right": 0}
+        self._recorded_grip_status_event_count = {"left": 0, "right": 0}
+        self._grip_status_stale_since: Optional[float] = None
+        self._grip_episode_start_wall_ns = -1
         # --record frame-freshness guard: the ZED-SDK publishers stream at ~15 fps while we
         # record at ~10 fps, so EVERY recorded frame must carry a camera frame strictly newer
         # than the previously recorded one (each head_left_rgb / {left,right}_wrist_rgb
@@ -632,6 +854,40 @@ class HardwareDriver:
         # take never records duplicates.
         self._last_rec_head_ns = -1
         self._last_rec_wrist_ns: dict[str, int] = {arm: -1 for arm in _WRIST_SENSOR_IDS}
+        # Dexcomm stamps each decoded Zenoh message on local receipt. _unwrap_frame
+        # updates this cache without changing the long-standing grab return signatures;
+        # record_tick persists it to separate network/decode latency from cache age.
+        self._last_camera_receive_ns: dict[str, int] = {}
+        # Poll caches at control rate and retain distinct capture frames for
+        # head-anchored nearest-wrist selection. Separate poll/history locks keep
+        # SDK access serialized without holding history locks during reads.
+        self._record_max_camera_skew_ns = 0
+        self._record_max_camera_age_ns = 0
+        self._camera_clock_offsets_ns: dict[str, int] = {}
+        self._head_alignment_buffer: deque[_HeadAlignmentSample] = deque(
+            maxlen=_HEAD_ALIGNMENT_BUFFER_FRAMES
+        )
+        self._wrist_alignment_buffers: dict[str, deque] = {
+            arm: deque(maxlen=_WRIST_ALIGNMENT_BUFFER_FRAMES) for arm in _WRIST_SENSOR_IDS
+        }
+        self._wrist_alignment_lock = threading.Lock()
+        # Recorder main loop and policy inference worker may both request a cache poll.
+        # Serialize the two-arm read so an older call cannot finish after a newer call
+        # and look like a publisher clock regression.
+        self._wrist_alignment_poll_lock = threading.Lock()
+        self._last_buffered_wrist_ns: dict[str, int] = {arm: -1 for arm in _WRIST_SENSOR_IDS}
+        self._last_buffered_head_ns = -1
+        self._camera_alignment_stale_since: Optional[float] = None
+        self._camera_age_stale_since: Optional[float] = None
+        self._record_camera_warmup_complete = True
+        self._record_camera_warmup_since: Optional[float] = None
+        self._record_head_settled = True
+        self._record_head_prev_meas: Optional[np.ndarray] = None
+        self._record_head_since: Optional[float] = None
+        # Publisher /info responses are queried for both stereo calibration and
+        # reproducibility metadata. Cache one authoritative response per physical
+        # camera so startup does not race two queries against a publisher restart.
+        self._camera_info_responses: dict[str, dict] = {}
         # Stale-grace state: loop time the current stale streak began (None while fresh),
         # plus a short per-recorded-frame arrival-age history (local wall clock minus the
         # publisher capture stamp; spans the robot<->workstation clock offset, so read the
@@ -647,6 +903,12 @@ class HardwareDriver:
         self._right_unpaired_streak = 0
         self._rec_right_unpaired = 0
         self._right_pair_retry = True
+        self._wrist_right_unpaired_since: dict[str, Optional[float]] = {
+            arm: None for arm in _WRIST_SENSOR_IDS
+        }
+        self._wrist_right_unpaired_streak: dict[str, int] = {arm: 0 for arm in _WRIST_SENSOR_IDS}
+        self._rec_wrist_right_unpaired: dict[str, int] = {arm: 0 for arm in _WRIST_SENSOR_IDS}
+        self._wrist_right_pair_retry: dict[str, bool] = {arm: True for arm in _WRIST_SENSOR_IDS}
 
         # Joint convention: with the hardware-matching URDF (wbik.yaml urdf_path:
         # vega_with_robotiq, corrected torso_j2 range + grippers) the WBC joint output
@@ -658,15 +920,15 @@ class HardwareDriver:
         try:
             print("[wbc_vr_robot] connecting to robot hardware ...")
             if args.record:
-                # Recording needs the head camera and both wrist ZED-Ms streaming, so build
-                # the Robot with all three sensors enabled.
+                # Recording needs the head camera AND both wrist ZED-Ms streaming, so build
+                # the Robot with all three sensors enabled (mirrors leader/vr_reader.py).
                 # Each wrist is a multi-stream ZED-M published by its own standalone
                 # ZED-SDK process; inject an RGB-only config if the variant lacks it. One
                 # ZED-SDK publisher per camera must run for frames to arrive.
-                from dexbot_utils.configs.components.sensors.cameras import (  # noqa: PLC0415
+                from dexbot_utils.configs.components.sensors.cameras import (
                     ZedXCameraConfig,
                 )
-                from dexcontrol.core.config import get_robot_config  # noqa: PLC0415
+                from dexcontrol.core.config import get_robot_config
 
                 configs = get_robot_config()
                 if "head_camera" not in configs.sensors:
@@ -684,29 +946,30 @@ class HardwareDriver:
                 self.robot = Robot(configs=configs)
             else:
                 self.robot = Robot()
-            # Component health: print the dexcontrol status table the same way the
-            # official examples do (display_robot_info.py) -- report, don't gate.
-            # The previous custom pass/fail check aborted startup on latched faults
-            # that the official tooling only displays.
-            # Settle first: Robot.__init__ ends with _set_default_state(), which only
-            # REQUESTS position mode on both arms -- the driver's operational status
-            # flips a beat later. Querying immediately prints a DISABLED arm that is
-            # already on its way to ENABLED (seen on right_arm, which is requested last).
+            # Keep subscribers alive through long idle/homing periods; the collection
+            # loop must not resume into a cold camera or motor-state cache.
+            self.robot.set_subscription_policy("always_on")
+            # Use dexcontrol's component-health report; its built-in lifecycle handling
+            # owns latched-fault recovery and startup gating.
             time.sleep(_STATUS_SETTLE)
             self.robot.get_component_status(show=True)
             nq = ik.nominal_q()
             self._nominal = {
-                grp: np.array([nq[ik._idx_q[n]] for n in names])  # noqa: SLF001
+                grp: np.array([nq[ik._idx_q[n]] for n in names])
                 for grp, names in self._joint_names.items()
             }
             self._init_recording()
             # Grippers are always active (the hardware is mounted): activate both Hand-E
-            # grippers so the per-tick trigger commands move them. Under --record also set
-            # up the FC03 achieved-position monitors for obs/gripper.
+            # grippers so the per-tick trigger commands move them. FC03 achieved-position
+            # monitors also supply collision geometry and the joystick contact latch.
             print("[wbc_vr_robot] activating grippers ...")
             send_activate(self.robot.left_arm)
             send_activate(self.robot.right_arm)
-            if args.record:
+            if (
+                args.record
+                or getattr(args, "gripper_contact_latch", False)
+                or self._gripper_collision_feedback
+            ):
                 self._init_gripper_monitors()
             if enable["base"]:
                 if not self.has_chassis:
@@ -714,6 +977,8 @@ class HardwareDriver:
                 self._wait_chassis()
                 self._odom = OdometryThread(self.robot, drive_state_mode=args.drive_state_mode)
                 self._odom.start()
+                if args.arkit_base != "off":
+                    self._start_arkit_tracker()
             home_to_nominal(self, arm_home_step=ARM_HOME_STEP)
         except BaseException:
             # Tear down partially-initialized hardware (odom thread, robot, base) before
@@ -809,10 +1074,108 @@ class HardwareDriver:
             time.sleep(0.05)
         raise SystemExit(f"[wbc_vr_robot] no chassis state within {timeout:.0f}s.")
 
+    def _start_arkit_tracker(self, timeout: float = 5.0) -> None:
+        """Subscribe to the iPhone base-pose publisher (--arkit-base), failing loudly.
+
+        The publisher runs on the USB host (scripts/base_tracking/base_pose_pub.py), so its topic
+        lives under the robot's Zenoh namespace, not the leader/follower ``--namespace``.
+        A missing publisher aborts here rather than mid-take: under ``control`` the base PD
+        would have no measured pose at all, and under ``record`` a take of NaN phone poses
+        is worth nothing and would only be discovered offline.
+        """
+        import os
+
+        namespace = os.environ.get("ROBOT_NAME", "")
+        if not namespace:
+            raise SystemExit(
+                "[wbc_vr_robot] --arkit-base needs $ROBOT_NAME (the robot's "
+                "Zenoh namespace, e.g. dm/<robot-id>)."
+            )
+        native = getattr(self, "_native_state_recorder", None)
+        tracker = ARKitBaseTracker(
+            namespace,
+            name="wbc_vr_robot_arkit",
+            event_sink=native.event if native is not None else None,
+        )
+        if not tracker.wait_first(timeout):
+            tracker.close()
+            raise SystemExit(
+                f"[wbc_vr_robot] --arkit-base {self.args.arkit_base}: no pose on "
+                f"'{tracker.topic}' within {timeout:.0f}s -- start the publisher on the "
+                "USB host (scripts/base_tracking/base_pose_pub.py) and check the phone is "
+                "streaming (lsusb | grep 12a8)."
+            )
+        snap = tracker.snapshot()
+        self._arkit = tracker
+        print(
+            f"[wbc_vr_robot] iPhone base tracking ({self.args.arkit_base}) on "
+            f"'{tracker.topic}': base roll/pitch "
+            f"{np.degrees(snap['rp'][0]):+.2f}/{np.degrees(snap['rp'][1]):+.2f}deg "
+            f"(constant on a flat floor -- drift here means the mount moved)"
+        )
+
+    def _arkit_drives_base(self) -> bool:
+        """True when the phone pose -- not the wheel odometry -- closes the base PD loop."""
+        return (
+            getattr(self, "_arkit", None) is not None
+            and getattr(getattr(self, "args", None), "arkit_base", "off") == "control"
+        )
+
+    def configured_base_pose_source(self) -> str:
+        """Pose source promised by the requested mode, even before sensors start.
+
+        Recording static metadata is assembled before ``_start_arkit_tracker()`` during
+        hardware initialization. It must describe the configured contract, not infer it
+        from whether the tracker object happens to exist at that earlier instant.
+        ``start_recording_episode`` later checks this promise against the live source.
+        """
+        mode = str(getattr(getattr(self, "args", None), "arkit_base", "off"))
+        return "arkit" if mode == "control" else "wheel_odometry"
+
+    def base_pose_source(self) -> str:
+        """Canonical measured-pose source shared by control, recording, and policy state."""
+        return "arkit" if self._arkit_drives_base() else "wheel_odometry"
+
+    def policy_base_pose_snapshot(self) -> dict:
+        """Snapshot the base pose in the same frame/source that closes the PD loop.
+
+        Wheel odometry is always retained because it supplies achieved body twist and
+        drift diagnostics. Under ``--arkit-base control`` the canonical policy pose is
+        instead the engage-zeroed ARKit pose; using odometry there would train/deploy a
+        world anchor different from the one controlling the physical base.
+        """
+        if self._odom is None:
+            raise RuntimeError("base pose snapshot requires wheel odometry")
+        odom = self._odom.snapshot()
+        arkit = self._arkit.snapshot() if self._arkit is not None else None
+        selected = arkit if self._arkit_drives_base() else odom
+        if selected is None:
+            raise RuntimeError("ARKit is the base pose source but has no snapshot")
+        pose = np.asarray(selected["pose"], dtype=np.float64)
+        if pose.shape != (3,) or not np.all(np.isfinite(pose)):
+            raise RuntimeError(f"{self.base_pose_source()} base pose {pose!r} is not finite (3,)")
+        return {
+            "source": self.base_pose_source(),
+            "pose": pose,
+            "odom": odom,
+            "arkit": arkit,
+        }
+
     def engage_reset(self, ik, left0, right0, head0) -> None:
         """Zero the odometry origin in lock-step with the IK reset at engage."""
         if self._odom is not None:
             self._odom.reset_origin()
+        if self._arkit is not None:
+            # Re-zeros on the latest phone pose AND clears the relocalization latch, so a
+            # re-engage is the documented recovery from an ARKit world jump. False means no
+            # sample to zero on: obs/base/pose_arkit stays NaN and, under control, the
+            # "arkit-no-origin" hold below keeps the base still until a pose arrives.
+            if not self._arkit.reset_origin():
+                print(
+                    "[wbc_vr_robot] WARNING: no iPhone pose to zero the ARKit origin on "
+                    "-- base tracking stays NaN until the publisher recovers."
+                )
+        self._world_frame_epoch += 1
         self._prev_base_cmd = np.zeros(3)
         self._prev_base_shaped = np.zeros(3)
         self._base_axis = None
@@ -825,20 +1188,135 @@ class HardwareDriver:
         if self._episode is not None and self._episode.recording:
             self._next_record_t = 0.0
 
-    def start_recording_if_teleop(self, vr) -> None:
-        """Start episode recording once the leader leaves any pre-record align stage."""
+    def start_recording_episode(self) -> bool:
+        """Start one episode after resetting every episode-local freshness latch.
+
+        Teleop and policy rollout deliberately share this boundary.  In particular,
+        camera receive stamps, stereo-pair retry state, and consumed FC03 event counts
+        must not leak from the preceding rollout into frame zero of the next one.
+        Returns ``True`` only when a recorder was actually started.
+        """
         if self._episode is None or self._episode.recording:
-            return
-        if vr is None or str(getattr(vr, "calib_stage", "")) != "teleop":
-            return
+            return False
+        configured_source = self.configured_base_pose_source()
+        live_source = self.base_pose_source()
+        if live_source != configured_source:
+            raise RuntimeError(
+                "[wbc_vr_robot] refusing to start recording: configured canonical "
+                f"base source is {configured_source!r}, but the live controller would "
+                f"record {live_source!r}"
+            )
+        self._refresh_camera_clock_offsets()
+        sweep = getattr(self, "_scenediff_session", None)
+        if sweep is not None:
+            self._record_static["meta"]["scenediff_sweep"] = sweep.episode_metadata()
+            self._episode.set_static(self._record_static)
+        native = getattr(self, "_native_state_recorder", None)
+        if native is not None:
+            self._record_static["meta"]["ntp"] = self._query_ntp_calibration()
+            native_file = native.start(
+                self._episode.episode_id,
+                {
+                    "ntp": self._record_static["meta"]["ntp"],
+                    "camera_ntp": self._record_static["meta"]["camera_ntp"],
+                    "recording_context": {
+                        "base_pose_source": configured_source,
+                        "arkit": (
+                            self._arkit.recording_context()
+                            if getattr(self, "_arkit", None) is not None
+                            else None
+                        ),
+                    },
+                },
+            )
+            self._record_static["meta"]["native_state"] = {
+                "file": np.asarray(native_file.encode()),
+                "schema": np.asarray(getattr(native, "SCHEMA", "native_state_v1").encode()),
+            }
+            self._episode.set_static(self._record_static)
         self._episode.start()
+        motion_recorder = getattr(self, "_camera_motion_recorder", None)
+        if motion_recorder is not None:
+            motion_file = motion_recorder.start(
+                self._episode.episode_id, self._record_static["meta"]["camera_ntp"]
+            )
+            self._record_static["meta"]["camera_motion"] = {
+                "file": np.asarray(motion_file.encode()),
+                "format": np.asarray(b"timestamped_jsonl_v1"),
+                "association": np.asarray(
+                    b"sensor_id + image_timestamp_ns; independent tracker worlds"
+                ),
+            }
+            self._episode.set_static(self._record_static)
+        self._grip_episode_start_wall_ns = time.time_ns()
         self._last_rec_head_ns = -1
         self._last_rec_wrist_ns = {arm: -1 for arm in _WRIST_SENSOR_IDS}
+        self._last_camera_receive_ns = {}
+        alignment_lock = getattr(self, "_wrist_alignment_lock", None)
+        if alignment_lock is None:
+            self._wrist_alignment_lock = threading.Lock()
+            alignment_lock = self._wrist_alignment_lock
+        poll_lock = getattr(self, "_wrist_alignment_poll_lock", None)
+        if poll_lock is None:
+            self._wrist_alignment_poll_lock = threading.Lock()
+            poll_lock = self._wrist_alignment_poll_lock
+        # Lock in the same poll->history order as _poll_camera_alignment_buffers(). A
+        # concurrent policy-camera grab that began before this episode must finish and
+        # append before the reset; it can never append a pre-boundary sample afterward.
+        with poll_lock:
+            with alignment_lock:
+                self._head_alignment_buffer = deque(maxlen=_HEAD_ALIGNMENT_BUFFER_FRAMES)
+                self._wrist_alignment_buffers = {
+                    arm: deque(maxlen=_WRIST_ALIGNMENT_BUFFER_FRAMES) for arm in _WRIST_SENSOR_IDS
+                }
+                self._last_buffered_head_ns = -1
+                self._last_buffered_wrist_ns = {arm: -1 for arm in _WRIST_SENSOR_IDS}
+        self._camera_alignment_stale_since = None
+        self._camera_age_stale_since = None
+        self._record_camera_warmup_complete = False
+        self._record_camera_warmup_since = None
+        self._record_head_settled = not bool(self.enable.get("head", False))
+        self._record_head_prev_meas = None
+        self._record_head_since = None
         self._next_record_t = 0.0
+        self._stale_since = None
+        self._frame_age_log.clear()
         self._right_unpaired_since = None
         self._right_unpaired_streak = 0
         self._rec_right_unpaired = 0
         self._right_pair_retry = True
+        self._wrist_right_unpaired_since = {arm: None for arm in _WRIST_SENSOR_IDS}
+        self._wrist_right_unpaired_streak = {arm: 0 for arm in _WRIST_SENSOR_IDS}
+        self._rec_wrist_right_unpaired = {arm: 0 for arm in _WRIST_SENSOR_IDS}
+        self._wrist_right_pair_retry = {arm: True for arm in _WRIST_SENSOR_IDS}
+        # Drain status replies queued before engage. Episodes 5/6 proved that merely
+        # snapshotting the counters is not enough: their first rows consumed request-id
+        # 0 replies that had sat queued for 107 s / 5 s. Folding those events into the
+        # cache *before* the counter baseline makes them ineligible for frame zero.
+        if getattr(self, "_grip_monitors", {}):
+            self._poll_gripper_status_step(allow_request=False)
+        # Status replies consumed before engage (including policy-rollout warm-up) are
+        # not fresh observations for frame zero. The first record tick must see a newer
+        # event from both arms whose callback time is after the episode boundary.
+        self._recorded_grip_status_event_count = dict(self._grip_status_event_count)
+        # Force the next actuation tick to issue a post-boundary FC03 before it is
+        # allowed to send an FC16 command. Do not issue it here: this method runs after
+        # actuation and could otherwise place FC03 immediately behind that tick's FC16.
+        self._next_grip_status_request_monotonic = {
+            side: 0.0 for side in getattr(self, "_grip_monitors", {})
+        }
+        self._grip_status_stale_since = None
+        return True
+
+    def start_recording_if_teleop(self, vr) -> None:
+        """Start episode recording once the leader leaves any pre-record align stage."""
+        if (
+            vr is None
+            or bool(getattr(vr, "estop", False))
+            or str(getattr(vr, "calib_stage", "")) != "teleop"
+        ):
+            return
+        self.start_recording_episode()
 
     def stop_recording_episode(self) -> None:
         """Stop and save the active episode without shutting down hardware.
@@ -853,13 +1331,18 @@ class HardwareDriver:
         # with the episode_<N>.hdf5 written this call.
         saved_id = getattr(self._episode, "episode_id", None)
         n = self._episode.num_frames()
+        native = getattr(self, "_native_state_recorder", None)
+        if native is not None:
+            native.stop(aborted=n == 0)
+        motion_recorder = getattr(self, "_camera_motion_recorder", None)
+        if motion_recorder is not None:
+            motion_recorder.stop(aborted=n == 0)
         path = self._episode.stop()
         if path is None:
             print("\n[wbc_vr_robot] recording: 0 frames -- nothing saved.")
             return
         print(f"\n[wbc_vr_robot] saving {n} frames -> {path} ...")
-        while self._episode.saving:
-            time.sleep(0.05)
+        _wait_for_recorder_save(self._episode, path=path)
         save_error = getattr(self._episode, "last_save_error", None)
         if save_error is not None:
             raise RuntimeError(
@@ -873,9 +1356,62 @@ class HardwareDriver:
                 f"({100.0 * paired / n:.1f}%) carry head_right_frame_ns == "
                 f"head_frame_ns. Only those yield FoundationStereo head depth."
             )
+        if getattr(getattr(self, "args", None), "wrist_right_rgb", False) and n:
+            for arm in _WRIST_SENSOR_IDS:
+                paired = n - self._rec_wrist_right_unpaired[arm]
+                print(
+                    f"[wbc_vr_robot] {arm} wrist stereo pairing: {paired}/{n} frames "
+                    f"({100.0 * paired / n:.1f}%) carry {arm}_wrist_right_frame_ns == "
+                    f"{arm}_wrist_frame_ns. Only those yield FoundationStereo depth."
+                )
         traj = getattr(self, "_traj", None)
         if traj is not None and saved_id is not None:
             traj.flush(saved_id)
+
+    def abort_recording_episode(self, reason: str) -> None:
+        """Quarantine an exception-truncated episode instead of blessing it complete.
+
+        Operator-requested boundaries (e-stop, Ctrl-C) still call
+        :meth:`stop_recording_episode` and produce a normal complete take. Runtime data
+        contract/safety exceptions call this path: already-captured frames remain
+        inspectable under ``.hdf5.partial`` with ``complete=false`` and ``abort_reason``,
+        but no porter glob can mistake them for training input.
+        """
+        if self._episode is None or not self._episode.recording:
+            return
+        native = getattr(self, "_native_state_recorder", None)
+        if native is not None:
+            native.stop(aborted=True)
+        motion_recorder = getattr(self, "_camera_motion_recorder", None)
+        if motion_recorder is not None:
+            motion_recorder.stop(aborted=True)
+        n = self._episode.num_frames()
+        abort = getattr(self._episode, "abort", None)
+        if not callable(abort):
+            self._episode.discard()
+            print(
+                "\n[wbc_vr_robot] recording aborted: recorder has no quarantine "
+                f"support; discarded {n} frame(s). reason={reason}"
+            )
+            return
+        path = abort(str(reason))
+        if path is None:
+            print(
+                "\n[wbc_vr_robot] recording aborted before frame zero; no file "
+                f"created. reason={reason}"
+            )
+            return
+        print(f"\n[wbc_vr_robot] quarantining {n} aborted frame(s) -> {path} ...")
+        _wait_for_recorder_save(self._episode, path=path)
+        save_error = getattr(self._episode, "last_save_error", None)
+        if save_error is not None:
+            raise RuntimeError(
+                f"[wbc_vr_robot] failed to quarantine aborted take {path}: {save_error}"
+            ) from save_error
+        print(
+            f"[wbc_vr_robot] aborted take quarantined -> {path} "
+            "(complete=false; excluded from training)"
+        )
 
     def home_to_nominal(self) -> None:
         """Run the startup nominal homing routine while the process stays live."""
@@ -897,15 +1433,134 @@ class HardwareDriver:
 
     def extra_hold(self, now, last_cmd_wall, estop) -> Optional[str]:
         """Hold (beyond e-stop/solve/safety) until a fresh command, or on stale stream/odom."""
-        from omniteleop.wbc_robot_util import compute_hold_reason  # noqa: PLC0415
+        from omniteleop.wbc_robot_util import compute_hold_reason
 
         odom_age = self._odom.age if self._odom is not None else None
-        return compute_hold_reason(estop, last_cmd_wall, now, self.args.source_timeout, odom_age)
+        reason = compute_hold_reason(estop, last_cmd_wall, now, self.args.source_timeout, odom_age)
+        if reason is not None or estop or not self._arkit_drives_base():
+            return reason
+        # Only when the phone closes the base loop: a stale or relocalized tracker makes
+        # the measured base pose meaningless, so hold rather than drive on it. A jump
+        # clears only on the next engage (which re-zeros the origin).
+        if self._arkit.age > self.args.source_timeout:
+            return "stale-arkit"
+        if self._arkit.jumped:
+            return "arkit-jump"
+        if not self._arkit.has_origin:
+            return "arkit-no-origin"
+        return None
+
+    def _prepare_gripper_command(
+        self, side: str, position: float, *, now_monotonic: float
+    ) -> Optional[tuple[float, bytes]]:
+        """Return the effective target/message, or None to suppress this side's write."""
+        return position, self._build_hande(position)
+
+    def _gripper_command_sent(self, side: str, position: float, message: bytes) -> None:
+        """Notify optional gripper control logic only after its command was dispatched."""
+
+    def _command_grippers(
+        self,
+        left_gripper: float,
+        right_gripper: float,
+        *,
+        now_monotonic: Optional[float] = None,
+    ) -> None:
+        """Dispatch bounded FC16 writes without colliding with FC03 status reads.
+
+        ``action/gripper`` is the latest command that actually reached the shared
+        pass-through, not an unsent 100 Hz desired value. Changed byte-level Hand-E
+        commands are sent at no more than 20 Hz and unchanged commands once per second.
+        When the status monitor has issued FC03, writes pause for its bounded 75 ms
+        transaction window so its reply cannot be buried by the next FC16 ACK. Healthy
+        replies arrive in roughly 5--8 ms, so normal changed-command latency is one
+        100 Hz control tick; a missing reply cannot freeze manual control indefinitely.
+        """
+        now_mono = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        commands = {
+            "left": float(np.clip(left_gripper, 0.0, 1.0)),
+            "right": float(np.clip(right_gripper, 0.0, 1.0)),
+        }
+        arms = {"left": self.robot.left_arm, "right": self.robot.right_arm}
+
+        # Keep object.__new__-constructed test drivers and older rollout wrappers
+        # compatible while all normal HardwareDriver instances initialize these fields
+        # in __init__.
+        if not hasattr(self, "_last_gripper_wire_message"):
+            self._last_gripper_wire_message = {"left": None, "right": None}
+        if not hasattr(self, "_last_gripper_wire_send_monotonic"):
+            self._last_gripper_wire_send_monotonic = {
+                "left": float("-inf"),
+                "right": float("-inf"),
+            }
+        if not hasattr(self, "_last_gripper_wire_change_monotonic"):
+            self._last_gripper_wire_change_monotonic = dict(self._last_gripper_wire_send_monotonic)
+
+        monitors = getattr(self, "_grip_monitors", {})
+        for side in ("left", "right"):
+            monitor = monitors.get(side)
+            if monitor is not None:
+                pending_age_fn = getattr(monitor, "pending_request_age_s", None)
+                if not callable(pending_age_fn):
+                    raise RuntimeError(
+                        "[wbc_vr_robot] gripper status monitor must expose "
+                        "pending_request_age_s(); cannot safely schedule FC16 writes "
+                        "from a depth-only pending counter"
+                    )
+            # Evaluate before bus/rate guards so a contact or release is remembered
+            # even when the resulting write has to wait for the FC03 transaction.
+            prepared = self._prepare_gripper_command(side, commands[side], now_monotonic=now_mono)
+            if prepared is None:
+                continue
+            commands[side], message = prepared
+            if monitor is not None:
+                next_status = float(
+                    getattr(self, "_next_grip_status_request_monotonic", {}).get(side, 0.0)
+                )
+                if next_status > 0.0 and now_mono >= next_status - _GRIPPER_STATUS_PRE_READ_GUARD_S:
+                    continue
+                pending_age = pending_age_fn()
+                if pending_age is not None and pending_age < _GRIPPER_STATUS_WRITE_GUARD_S:
+                    continue
+
+            last_message = self._last_gripper_wire_message[side]
+            elapsed = now_mono - float(self._last_gripper_wire_send_monotonic[side])
+            changed_due = message != last_message and elapsed >= _GRIPPER_COMMAND_MIN_PERIOD_S
+            keepalive_due = elapsed >= _GRIPPER_COMMAND_KEEPALIVE_S
+            if not (changed_due or keepalive_due):
+                continue
+
+            send_start = time.time_ns()
+            self._send_ee_pass_through(arms[side], message)
+            record_event(
+                self,
+                "gripper_command",
+                dict(
+                    side=side,
+                    normalized=commands[side],
+                    wire_hex=message.hex(),
+                    start_wall_ns=send_start,
+                    end_wall_ns=time.time_ns(),
+                ),
+            )
+            if message != last_message:
+                self._last_gripper_wire_change_monotonic[side] = now_mono
+            self._last_gripper_wire_message[side] = message
+            self._last_gripper_wire_send_monotonic[side] = now_mono
+            setattr(self, f"_last_gripper_cmd_{side}", commands[side])
+            self._gripper_command_sent(side, commands[side], message)
 
     def actuate(self, result, left_gripper, right_gripper, enable, hold, dt) -> None:
         """Send the IK result to the enabled actuators (clamped); zero/freeze on hold."""
-        from omniteleop.wbc_robot_util import clamp_joint_step  # noqa: PLC0415
+        from omniteleop.wbc_robot_util import clamp_joint_step
 
+        self._last_action_dispatch_start_wall_ns = time.time_ns()
+        self._last_action_dispatch_end_wall_ns = -1
+        # Status traffic gets first use of each arm's shared Modbus pass-through. Doing
+        # this before _command_grippers is what prevents a changed trigger (or FC16
+        # keepalive) from being emitted immediately before the due FC03 read.
+        if getattr(self, "_grip_monitors", {}):
+            self._poll_gripper_status_step(now_monotonic=time.monotonic())
         cmds = {
             "torso": result.torso,
             "left_arm": result.left_arm,
@@ -920,9 +1575,22 @@ class HardwareDriver:
         }
         self._dbg["cmd_joints"] = {g: np.asarray(c, dtype=float) for g, c in cmds.items()}
         if hold:
-            # Freeze joints (send nothing) and re-seed the clamp anchor on resume.
+            # Freeze joints (send nothing) and re-seed the clamp anchor on resume -- except
+            # the head, which keeps receiving its last command (nominal before any): with
+            # dexcontrol 0.5 the neck pitch SAGS once commands stop (episode 0: head_j1
+            # drifted -0.25 -> -0.68 rad over the pre-engage hold, then swung back through
+            # the first 0.4 s of the take). Re-sending the held position is zero motion.
             for grp in self._prev_cmd:
-                self._prev_cmd[grp] = None
+                if grp != "head":
+                    self._prev_cmd[grp] = None
+            if grp_on["head"]:
+                head_hold = self._prev_cmd["head"]
+                if head_hold is None:
+                    head_hold = np.asarray(self._nominal["head"], dtype=float)
+                    self._prev_cmd["head"] = head_hold
+                self._comp("head").set_joint_pos(
+                    self._to_hw("head", head_hold).tolist(), wait_time=0.0
+                )
             self._dbg["sent_joints"] = None
             self._dbg["clamp_max_over"] = float("nan")
         else:
@@ -932,24 +1600,39 @@ class HardwareDriver:
                 if not grp_on[grp]:
                     continue
                 prev = self._prev_cmd[grp]
-                if prev is None:
+                first_tick = prev is None
+                if first_tick:
                     prev = np.asarray(self._comp(grp).get_joint_pos(), dtype=float)
                 clamped, requested = clamp_joint_step(prev, cmd, self.args.max_joint_step)
+                actual_sent = clamped
                 max_over = max(max_over, requested)
-                self._comp(grp).set_joint_pos(self._to_hw(grp, clamped).tolist(), wait_time=0.0)
+                if grp in ("left_arm", "right_arm") and not first_tick:
+                    # Feed forward the post-clamp command delta to offset arm tracking lag.
+                    # The first tick after engage has no previous command for differencing.
+                    tau = float(getattr(self.args, "arm_cmd_lpf_tau", DEFAULT_ARM_CMD_LPF_TAU))
+                    prev_filt = self._arm_filt[grp]
+                    if prev_filt is None:
+                        prev_filt = prev
+                    filt = prev_filt + (clamped - prev_filt) * (dt / (tau + dt))
+                    vel = (filt - prev_filt) / dt
+                    self._arm_filt[grp] = filt
+                    actual_sent = filt
+                    self._comp(grp).set_joint_pos_vel(
+                        self._to_hw(grp, filt).tolist(), self._to_hw(grp, vel).tolist()
+                    )
+                else:
+                    if grp in self._arm_filt:
+                        self._arm_filt[grp] = None
+                    self._comp(grp).set_joint_pos(self._to_hw(grp, clamped).tolist(), wait_time=0.0)
                 self._prev_cmd[grp] = clamped
-                sent[grp] = clamped
+                sent[grp] = actual_sent.copy()
             self._dbg["sent_joints"] = sent
             self._dbg["clamp_max_over"] = max_over
-            # Grippers are always active: command both Hand-E grippers from the leader
-            # triggers and stash the clipped values so record_tick logs them as
-            # action/gripper (this non-hold branch is the only place that records).
-            lg = float(np.clip(left_gripper, 0.0, 1.0))
-            rg = float(np.clip(right_gripper, 0.0, 1.0))
-            self._send_ee_pass_through(self.robot.left_arm, self._build_hande(lg))
-            self._send_ee_pass_through(self.robot.right_arm, self._build_hande(rg))
-            self._last_gripper_cmd_left = lg
-            self._last_gripper_cmd_right = rg
+            # Grippers are always active. Their serial pass-through is scheduled below
+            # the 100 Hz IK rate so FC03 achieved-state reads get a response window.
+            # The cached action values update only when the corresponding FC16 command
+            # really reaches the wire.
+            self._command_grippers(left_gripper, right_gripper)
             # Abort if the IK keeps demanding far more than the clamp (runaway / bad target).
             if self.args.max_joint_step > 0 and max_over > 2.0 * self.args.max_joint_step:
                 self._overstep_ticks += 1
@@ -961,11 +1644,30 @@ class HardwareDriver:
                     )
             else:
                 self._overstep_ticks = 0
+        base_start = time.time_ns()
         self._drive_base(result, hold, enable, dt)
+        self._last_action_dispatch_end_wall_ns = time.time_ns()
+        record_event(
+            self,
+            "dispatch",
+            dict(
+                start_wall_ns=self._last_action_dispatch_start_wall_ns,
+                end_wall_ns=self._last_action_dispatch_end_wall_ns,
+                base_start_wall_ns=base_start,
+                hold=bool(hold),
+                enable=dict(enable),
+                sent_joints=self._dbg.get("sent_joints"),
+                base_action=self._dbg.get("base_action"),
+                base_cmd=self._dbg.get("base_cmd"),
+                rx_chassis=self._dbg.get("rx_chassis"),
+                held_head=(self._prev_cmd.get("head") if hold and grp_on["head"] else None),
+            ),
+        )
 
     def _drive_base(self, result, hold, enable, dt) -> None:
         if self._odom is None or not enable["base"]:
             self._dbg["odom"] = None
+            self._dbg["arkit"] = None
             self._dbg["base_pd_raw"] = None
             self._dbg["base_pd_err"] = None
             self._dbg["base_cmd"] = None
@@ -975,6 +1677,11 @@ class HardwareDriver:
         # tick come from the same integrated sample.
         snap = self._odom.snapshot()
         self._dbg["odom"] = snap
+        # Snapshot the phone tracker on every tick it runs -- /debug then carries both
+        # measured poses for the SAME tick, which is how the odometry drift is measured
+        # before --arkit-base control is trusted with the loop.
+        arkit = self._arkit.snapshot() if self._arkit is not None else None
+        self._dbg["arkit"] = arkit
         chassis = self.robot.chassis
         if hold:
             chassis.set_velocity(vx=0.0, vy=0.0, wz=0.0, wait_time=0.0)
@@ -991,10 +1698,13 @@ class HardwareDriver:
         max_lin = self.args.base_max_speed
         max_ang = 2.0 * self.args.base_max_speed
         allow_yaw_hold = self._allow_base_yaw_hold_in_xy()
+        # extra_hold() has already forced a hold (and returned above) if the phone pose
+        # is stale, jumped, or has no origin, so this branch can never see a NaN pose.
+        measured = arkit["pose"] if self._arkit_drives_base() else snap["pose"]
         raw, err = base_cl.pd_twist(
             result.base_pose,
             result.base_twist,
-            snap["pose"],
+            measured,
             kp_xy=self.args.base_kp_xy,
             kp_yaw=self.args.base_kp_yaw,
             max_lin_speed=max_lin,
@@ -1073,7 +1783,7 @@ class HardwareDriver:
         """Apply the WBC base-DOF policy to a downstream chassis twist."""
         base_cl = getattr(self, "_base_cl", None)
         if base_cl is None:
-            from omniteleop.follower import base_closed_loop as base_cl  # noqa: PLC0415
+            from omniteleop.follower import base_closed_loop as base_cl
         return base_cl.mask_planar_twist_for_base_dofs(
             twist,
             base_dofs=self.cfg.base_dofs,
@@ -1104,6 +1814,7 @@ class HardwareDriver:
         if meas is None:  # open-loop: read now (post-actuation)
             meas = self._read_measured_joints()
         odom = d.get("odom")
+        arkit = d.get("arkit")
         row = {
             "base_twist": np.asarray(result.base_twist, dtype=np.float32),
             "base_pd_raw": vec(d.get("base_pd_raw"), 3),
@@ -1116,6 +1827,15 @@ class HardwareDriver:
             "odom_wvel": vec(odom["wvel"] if odom else None, 2),
             "odom_age": np.float32(odom["age"] if odom else np.nan),
             "odom_drive_ts_ns": np.int64(odom["drive_ts_ns"] if odom else -1),
+            # iPhone tracker (--arkit-base), NaN when it is not running: the engage-origin
+            # pose to difference against odom_pose, the ARKit-world pose that survives
+            # re-engages, and the base roll/pitch + jump count that say whether to believe
+            # either of them.
+            "arkit_pose": vec(arkit["pose"] if arkit else None, 3),
+            "arkit_world": vec(arkit["world_pose"] if arkit else None, 3),
+            "arkit_rp": vec(arkit["rp"] if arkit else None, 2),
+            "arkit_age": np.float32(arkit["age"] if arkit else np.nan),
+            "arkit_jumps": np.int64(arkit["jumps"] if arkit else -1),
         }
         for g in self._joint_names:
             row[f"cmd_{g}"] = grp(d.get("cmd_joints"), g)
@@ -1123,18 +1843,17 @@ class HardwareDriver:
             row[f"meas_{g}"] = grp(meas, g)
         return row
 
-    # -- episode recording ------------------------------------------------------
-
+    # episode recording (vr_reader EpisodeRecorder format)
     def _init_gripper_monitors(self) -> None:
-        """Set up the Robotiq FC03 achieved-position monitors for obs/gripper recording.
+        """Set up FC03 achieved-position monitors for geometry, latching and recording.
 
-        A synchronous warmup poll seeds ``self._last_obs_grip_{left,right}`` (gPO/255 in
-        [0,1]), then a
+        Mirrors ``leader/vr_reader.py`` + ``follower/policy_rollout.py``: a synchronous
+        warmup poll seeds ``self._last_obs_grip_{left,right}`` (gPO/255 in [0,1]), then a
         ``RobotiqStatusMonitor`` per arm queues FC03 status replies on the shared EE
         pass-through topic -- coexisting with this follower's FC16 gripper writes, which
-        the monitor filters out. Only needed under ``--record`` (obs/gripper).
+        the monitor filters out. Missing/stale replies leave collision tips at full sweep.
         """
-        from omniteleop.follower.robotiq import (  # noqa: PLC0415
+        from omniteleop.follower.robotiq import (
             RobotiqStatusMonitor,
             poll_gripper_status,
         )
@@ -1142,31 +1861,211 @@ class HardwareDriver:
         for side, arm in (("left", self.robot.left_arm), ("right", self.robot.right_arm)):
             warm = poll_gripper_status(arm, function_code=0x03, timeout_s=0.5)
             if warm is None:
-                raise SystemExit(
+                message = (
                     f"[wbc_vr_robot] {side} gripper FC03 warmup failed -- "
-                    f"obs/gripper/{side} would record NaN until the monitor catches up "
+                    f"obs/gripper/{side} stays NaN until a later status reply "
                     "(verify enable_ee_pass_through=True)."
                 )
+                if self.args.record:
+                    raise SystemExit(
+                        message + " Refusing to record a take with no gripper position."
+                    )
+                # Homing and teleop can run. Collision treats a missing reply as the
+                # full finger stroke; the contact latch holds that gripper until a
+                # healthy status arrives.
+                print(message + " Continuing without a seed; the monitor will catch up.")
+                continue
             setattr(self, f"_last_obs_grip_{side}", float(warm["actual"]))
+            self._last_grip_status[side] = dict(warm)
         self._grip_monitors = {
             "left": RobotiqStatusMonitor(self.robot.left_arm, side="left", function_code=0x03),
             "right": RobotiqStatusMonitor(self.robot.right_arm, side="right", function_code=0x03),
         }
-        for monitor in self._grip_monitors.values():
-            monitor.send_status_request()
+        period = self._gripper_status_poll_period_s()
+        for side, monitor in self._grip_monitors.items():
+            event = monitor.send_status_request()
+            record_event(self, "gripper_request", dict(side=side, request=event))
+            sent_mono = float(event["send_monotonic_ns"]) / 1e9
+            self._next_grip_status_request_monotonic[side] = sent_mono + period
 
-    def _poll_gripper_status_step(self) -> None:
-        """Drain queued FC03 replies into the obs cache, then re-request (both arms).
+    def _gripper_status_poll_period_s(self) -> float:
+        """Status cadence; collision feedback stays at least 10 Hz."""
+        period = float(getattr(self, "_record_period", 0.0))
+        period = period if np.isfinite(period) and period > 0.0 else 0.1
+        return min(period, 0.1) if getattr(self, "_gripper_collision_feedback", False) else period
 
-        Called at the record cadence from ``record_tick`` so
-        ``self._last_obs_grip_{left,right}`` refresh at ~``--record-rate``.
+    def update_gripper_collision_geometry(self, ik: VegaWholeBodyIK, dt: float) -> None:
+        """Consume achieved-position replies before IK, without scheduling extra reads."""
+        from omniteleop.follower.gripper_collision import feedback_interval
+
+        if getattr(self, "_grip_monitors", None):
+            self._poll_gripper_status_step(allow_request=False)
+        now = time.monotonic()
+        statuses = getattr(self, "_last_grip_status", {})
+        commands = getattr(self, "_last_gripper_wire_message", {})
+        changes = getattr(self, "_last_gripper_wire_change_monotonic", {})
+        ik.update_gripper_collision_geometry(
+            **{
+                side: feedback_interval(
+                    statuses.get(side),
+                    now,
+                    dt,
+                    command=commands.get(side),
+                    command_change=changes.get(side),
+                )
+                for side in ("left", "right")
+            }
+        )
+
+    def _poll_gripper_status_step(
+        self,
+        *,
+        allow_request: bool = True,
+        now_monotonic: Optional[float] = None,
+    ) -> None:
+        """Drain FC03 replies and, when due, issue one prioritized read per arm.
+
+        Called from the 100 Hz actuation loop *before* FC16 command scheduling, but new
+        requests are rate-limited to ``--record-rate``. ``record_tick`` uses
+        ``allow_request=False`` so it may consume a callback that arrived during
+        actuation/camera work without ever placing FC03 immediately behind an FC16.
         """
+        now_mono = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        period = self._gripper_status_poll_period_s()
+        if not hasattr(self, "_next_grip_status_request_monotonic"):
+            self._next_grip_status_request_monotonic = {side: 0.0 for side in self._grip_monitors}
         for side, monitor in self._grip_monitors.items():
             events = monitor.drain_status_events()
+            for status_event in events:
+                record_event(self, "gripper_status", dict(side=side, status=status_event))
             if events:
-                setattr(self, f"_last_obs_grip_{side}", float(events[-1]["actual"]))
-            monitor.expire_timeouts(0.5)
-            monitor.send_status_request()
+                record_event(self, "gripper_monitor", dict(side=side, stats=monitor.stats()))
+                latest = dict(events[-1])
+                setattr(self, f"_last_obs_grip_{side}", float(latest["actual"]))
+                self._last_grip_status[side] = latest
+                self._grip_status_event_count[side] += len(events)
+            expired = monitor.expire_timeouts(_GRIPPER_STATUS_REQUEST_TIMEOUT_S)
+            if expired:
+                record_event(self, "gripper_timeout", dict(side=side, requests=expired))
+            # Keep at most one read outstanding and one scheduled request per record
+            # period. A timed-out slot advances normally rather than causing the old
+            # 500 ms hole; late retries are re-anchored instead of sent in a burst.
+            next_due = float(self._next_grip_status_request_monotonic.get(side, 0.0))
+            if (
+                allow_request
+                and now_mono >= next_due
+                and monitor.stats()["pending_status_requests"] == 0
+            ):
+                event = monitor.send_status_request()
+                record_event(self, "gripper_request", dict(side=side, request=event))
+                sent_mono = now_mono
+                if isinstance(event, dict) and "send_monotonic_ns" in event:
+                    sent_mono = float(event["send_monotonic_ns"]) / 1e9
+                candidate = next_due + period if next_due > 0.0 else sent_mono + period
+                self._next_grip_status_request_monotonic[side] = (
+                    sent_mono + period if candidate <= now_mono else candidate
+                )
+
+    def _fresh_gripper_statuses(self) -> Optional[dict[str, dict]]:
+        """Return bounded-age FC03 samples for one row, marking any zero-order hold.
+
+        Requiring a distinct packet for every 10 Hz image row made one lost Modbus reply
+        create a 500 ms timestamp hole in episode 7. The meaningful safety property is
+        bounded sensor age, not packet uniqueness: reuse is selected with a 0.1-period
+        commit margin inside the persisted 2.5-period limit and is written explicitly
+        as ``sample_reused``. Both arms still pass atomically, and frame zero still
+        requires callbacks after engage.
+        """
+        statuses = {side: self._last_grip_status[side] for side in ("left", "right")}
+        if any(status is None for status in statuses.values()):
+            return None
+        episode_start_ns = int(getattr(self, "_grip_episode_start_wall_ns", -1))
+        if episode_start_ns > 0:
+            now_wall_ns = time.time_ns()
+            record_period = float(getattr(self, "_record_period", 0.1))
+            max_age_ns = round(
+                (_GRIPPER_STATUS_MAX_AGE_PERIODS - _GRIPPER_STATUS_COMMIT_MARGIN_PERIODS)
+                * record_period
+                * 1e9
+            )
+            for side in ("left", "right"):
+                status = statuses[side]
+                read_ns = int(status.get("read_wall_ns", -1))
+                request_ns = int(status.get("request_send_wall_ns", -1))
+                # Provenance must describe a real, post-boundary transaction. Runtime
+                # and offline checks use the same request and sample-age limits.
+                if read_ns < episode_start_ns or request_ns <= 0:
+                    return None
+                request_latency_ns = read_ns - request_ns
+                if request_latency_ns < 0 or request_latency_ns > round(
+                    _GRIPPER_STATUS_REQUEST_TIMEOUT_S * 1e9
+                ):
+                    return None
+                age_ns = now_wall_ns - read_ns
+                if age_ns < 0 or age_ns > max_age_ns:
+                    return None
+        if any(
+            self._grip_status_event_count[side] < self._recorded_grip_status_event_count[side]
+            for side in ("left", "right")
+        ):
+            raise RuntimeError("gripper status event counter regressed")
+        out = {}
+        for side in ("left", "right"):
+            status = dict(statuses[side])
+            status["sample_reused"] = (
+                self._grip_status_event_count[side] == self._recorded_grip_status_event_count[side]
+            )
+            out[side] = status
+        self._recorded_grip_status_event_count = dict(self._grip_status_event_count)
+        return out
+
+    def _validate_gripper_status_commit_age(
+        self,
+        statuses: dict[str, dict],
+        commit_wall_ns: int,
+    ) -> None:
+        """Enforce the porter's exact 2.5-period age bound at final row commit."""
+        max_age_ns = round(
+            _GRIPPER_STATUS_MAX_AGE_PERIODS * float(getattr(self, "_record_period", 0.1)) * 1e9
+        )
+        for side, status in statuses.items():
+            read_wall_ns = int(status.get("read_wall_ns", -1))
+            age_ns = int(commit_wall_ns) - read_wall_ns
+            if age_ns < 0 or age_ns > max_age_ns:
+                raise RuntimeError(
+                    "[wbc_vr_robot] --record: gripper status crossed the exact "
+                    f"commit-age contract while assembling the row: {side}={age_ns / 1e6:.3f} "
+                    f"ms, maximum={max_age_ns / 1e6:.3f} ms. Aborting instead of "
+                    "writing a row the offline policy porter would reject."
+                )
+
+    @staticmethod
+    def _recordable_gripper_status(status: dict) -> dict:
+        """Convert a parsed monitor event into a fixed, HDF5-safe telemetry tree."""
+
+        def _int(name: str, default: int = -1) -> np.int64:
+            value = status.get(name, default)
+            return np.int64(default if value is None else value)
+
+        return {
+            "actual": np.float32(status["actual"]),
+            "cmd_echo": np.float32(status["cmd_echo"]),
+            "gPO": _int("gPO"),
+            "gPR": _int("gPR"),
+            "gCU": _int("gCU"),
+            "gACT": _int("gACT"),
+            "gGTO": _int("gGTO"),
+            "gSTA": _int("gSTA_bits"),
+            "gOBJ": _int("gOBJ"),
+            "gFLT": _int("gFLT"),
+            "kFLT": _int("kFLT"),
+            "status_request_id": _int("status_request_id"),
+            "request_send_wall_ns": _int("request_send_wall_ns"),
+            "response_timestamp_ns": _int("response_timestamp_ns"),
+            "response_sequence": _int("response_sequence"),
+            "read_wall_ns": _int("read_wall_ns"),
+            "sample_reused": np.bool_(bool(status.get("sample_reused", False))),
+        }
 
     def _await_record_cameras(self) -> None:
         """Require the --record cameras to be streaming before a take can start.
@@ -1193,26 +2092,13 @@ class HardwareDriver:
                 )
 
     def _init_recording(self) -> None:
-        """Set up the optional HDF5 episode recorder (``--record``).
+        """Initialize optional HDF5 recording and independent telemetry sidecars.
 
-        Off unless ``--record``. When on, records while engaged:
-          * ``action/joint`` adds ``torso`` (the WBC commands the torso here too);
-          * the base action ``chassis_*`` is the shaped twist actually sent to the
-            chassis;
-          * with ``--enable base``, ``obs/joint`` adds the MEASURED base twist ``chassis_*``
-            (wheel-odometry body twist, achieved-velocity counterpart to the action) and
-            ``obs/base/pose`` adds the measured ``(x, y, yaw)`` base pose in the engage-origin
-            world frame;
-          * ``obs/images`` stores the ``intrinsic`` once (static, constant over a take) and
-            does NOT store the per-frame ``extrinsic`` -- ``world_t_cam`` is recomputed offline
-            from ``obs/base/pose`` and ``obs/joint``.
-        ``action/gripper`` is the leader trigger command, ``obs/gripper`` the Robotiq FC03
-        achieved position, and ``obs/images`` carries
-        head_left_rgb/head_depth/{left,right}_wrist_rgb plus the per-frame capture stamps
-        (head_frame_ns/head_depth_frame_ns/{left,right}_wrist_frame_ns/grab_wall_ns);
-        ``meta/ntp`` stores the once-per-run robot-SoC-vs-local clock offset, while
-        ``meta/camera_ntp`` stores camera-publisher-host-vs-local offsets
-        (see :meth:`_query_ntp_calibration` and :meth:`_query_camera_clock_calibrations`).
+        Record targets and dispatched joint commands alongside measured joints, gripper
+        feedback, and camera frames. Canonical base pose follows the selected control
+        source; wheel odometry is retained separately. Intrinsics come from live camera
+        publishers and are stored once; extrinsics can be reconstructed from FK.
+        Recording requires head and both wrist streams plus clock calibration.
         """
         self._record_period = 0.0
         self._next_record_t = 0.0
@@ -1221,49 +2107,378 @@ class HardwareDriver:
             raise ValueError(
                 f"--record-stale-grace must be finite and >= 0, got {self._stale_grace}"
             )
+        self._record_startup_timeout_s = float(
+            getattr(
+                self.args,
+                "record_startup_timeout",
+                DEFAULT_RECORD_STARTUP_TIMEOUT,
+            )
+        )
+        if not np.isfinite(self._record_startup_timeout_s) or self._record_startup_timeout_s <= 0.0:
+            raise ValueError(
+                "--record-startup-timeout must be finite and > 0, got "
+                f"{self._record_startup_timeout_s}"
+            )
+        max_camera_skew_ms = float(
+            getattr(
+                self.args,
+                "record_max_camera_skew_ms",
+                DEFAULT_RECORD_MAX_CAMERA_SKEW_MS,
+            )
+        )
+        if not np.isfinite(max_camera_skew_ms) or max_camera_skew_ms < 0.0:
+            raise ValueError(
+                f"--record-max-camera-skew-ms must be finite and >= 0, got {max_camera_skew_ms}"
+            )
+        self._record_max_camera_skew_ns = int(round(max_camera_skew_ms * 1e6))
+        max_camera_age_ms = float(
+            getattr(
+                self.args,
+                "record_max_camera_age_ms",
+                DEFAULT_RECORD_MAX_CAMERA_AGE_MS,
+            )
+        )
+        if not np.isfinite(max_camera_age_ms) or max_camera_age_ms <= 0.0:
+            raise ValueError(
+                f"--record-max-camera-age-ms must be finite and > 0, got {max_camera_age_ms}"
+            )
+        self._record_max_camera_age_ns = int(round(max_camera_age_ms * 1e6))
         if not self.args.record:
             return
         self._await_record_cameras()
         self._record_period = 1.0 / self.args.record_rate
         recorder_cls = StreamingEpisodeRecorder if self.args.streaming_recorder else EpisodeRecorder
         self._episode = recorder_cls(self.args.save_dir)
-        # Always query the live publisher: intrinsics are device-, resolution-, crop-, and
-        # resize-specific, so a repository constant must never describe recorded pixels.
-        head_stereo = self._query_head_stereo_calibration(require_right=self.args.head_right_rgb)
-        head_intrinsic = head_stereo["left_K"]
-        # Camera intrinsic is constant over a take -> store ONCE (obs/images/intrinsic is
-        # (3,3), not (N,3,3)). The per-frame extrinsic is NOT stored: it was base-relative
-        # head FK (base-blind, wrong once the base drives) and is fully recomputable, so it
-        # is recomputed offline as world_t_cam = world_t_base(obs/base/pose) . FK_cam(obs/
-        # joint), which places the camera in the world frame.
+        head_calibration = (
+            self._query_head_stereo_calibration()
+            if self.args.head_right_rgb
+            else self._query_head_stereo_calibration(require_right=False)
+        )
+        head_stereo = head_calibration if self.args.head_right_rgb else None
+        wrist_stereo = (
+            self._query_wrist_stereo_calibrations()
+            if getattr(self.args, "wrist_right_rgb", False)
+            else None
+        )
+        # When recording the stereo pair, the publisher's rectified left_K describes the
+        # exact VIEW.LEFT pixels in this run and is therefore authoritative. ZED_K remains
+        # the compatibility fallback for the legacy left+SDK-depth path.
+        head_intrinsic = head_calibration["left_K"]
+        # Store the live intrinsic once per take; reconstruct extrinsics offline
+        # from measured joints and the selected base-pose source.
+        camera_ntp = self._query_camera_clock_calibrations()
+        required_clock_labels = {"head", "left_wrist", "right_wrist"}
+        missing_clock_labels = sorted(required_clock_labels - set(camera_ntp))
+        if missing_clock_labels:
+            raise RuntimeError(
+                "[wbc_vr_robot] camera clock calibration is missing "
+                f"{missing_clock_labels}; capture-nearest camera alignment requires all "
+                "three publisher clocks."
+            )
+        try:
+            self._camera_clock_offsets_ns = {
+                label: int(np.asarray(camera_ntp[label]["offset_ns"]))
+                for label in required_clock_labels
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "[wbc_vr_robot] malformed camera clock calibration: every camera needs "
+                "an integer offset_ns"
+            ) from exc
+
         static: dict = {"obs": {"images": {"intrinsic": head_intrinsic}}}
         static["meta"] = {
             "ntp": self._query_ntp_calibration(),
-            "camera_ntp": self._query_camera_clock_calibrations(),
+            "camera_ntp": camera_ntp,
+            "camera_alignment": {
+                "mode": np.asarray(
+                    (
+                        b"head_capture_nearest"
+                        if self._record_max_camera_skew_ns > 0
+                        else b"latest_arrived_compatibility"
+                    )
+                ),
+                "anchor": np.asarray(b"head_left_rgb_capture"),
+                "clock_domain": np.asarray(b"local_via_camera_ntp"),
+                "max_abs_skew_ns": np.int64(self._record_max_camera_skew_ns),
+                "max_camera_age_ns": np.int64(self._record_max_camera_age_ns),
+                "stale_grace_ns": np.int64(round(self._stale_grace * 1e9)),
+                "head_buffer_frames": np.int64(_HEAD_ALIGNMENT_BUFFER_FRAMES),
+                "wrist_buffer_frames": np.int64(_WRIST_ALIGNMENT_BUFFER_FRAMES),
+                "startup_timeout_ns": np.int64(round(self._record_startup_timeout_s * 1e9)),
+                "startup_min_head_frames": np.int64(_RECORD_STARTUP_MIN_HEAD_FRAMES),
+                "startup_min_wrist_frames": np.int64(_RECORD_STARTUP_MIN_WRIST_FRAMES),
+            },
+            "cameras": self._recording_camera_metadata(),
+            "provenance": self._recording_provenance_metadata(),
         }
-        static["meta"]["head_stereo"] = head_stereo
+        if head_stereo is not None:
+            static["meta"]["head_stereo"] = head_stereo
+        if wrist_stereo is not None:
+            static["meta"]["wrist_stereo"] = wrist_stereo
         static["meta"].update(self._recording_control_metadata())
+        # Tracking telemetry uses its own full-rate stream and writer. Discovery is
+        # from already-queried publisher metadata; record_tick never waits for poses.
+        motion_info = {
+            sensor: info
+            for sensor, info in getattr(self, "_camera_info_responses", {}).items()
+            if info.get("motion", {}).get("enabled", False)
+        }
+        if motion_info:
+            from omniteleop.common.camera_motion_recorder import CameraMotionRecorder
+
+            self._camera_motion_recorder = CameraMotionRecorder(
+                self.robot._node, self.args.save_dir, motion_info
+            )
+        from omniteleop.common.native_state_recorder import NativeStateRecorder
+
+        groups = ("left_arm", "right_arm", "head", "torso")
+        components = {g: getattr(self.robot, g) for g in groups}
+        self._native_state_recorder = NativeStateRecorder(
+            self.robot._node,
+            self.args.save_dir,
+            {g: list(c.get_joint_name()) for g, c in components.items()},
+            {g: c._control_pub_topic for g, c in components.items()},
+        )
+        self._native_state_recorder.start_clock_sampling(
+            {
+                "soc": self._query_ntp_calibration,
+                **{
+                    label: (
+                        lambda label=label, sid=sid: self._query_camera_clock_calibration(
+                            label, sid
+                        )
+                    )
+                    for label, sid in (
+                        ("head", _HEAD_SENSOR_ID),
+                        *((f"{arm}_wrist", sid) for arm, sid in _WRIST_SENSOR_IDS.items()),
+                    )
+                },
+            }
+        )
+        self._record_static = static  # refreshed per episode, see _refresh_camera_clock_offsets
         self._episode.set_static(static)
         head_keys = "head_left_rgb" if self.args.no_head_depth else "head_left_rgb+head_depth"
         if self.args.head_right_rgb:
             head_keys += "+head_right_rgb"
+        wrist_keys = "left_wrist_rgb+right_wrist_rgb"
+        if getattr(self.args, "wrist_right_rgb", False):
+            wrist_keys += "+{left,right}_wrist_right_rgb"
         print(
             f"[wbc_vr_robot] recording -> {self.args.save_dir} "
             f"(episode_{self._episode.episode_id}, {self.args.record_rate:g}Hz, "
             f"{'streaming' if self.args.streaming_recorder else 'buffered'}, "
-            f"{head_keys}+left_wrist_rgb+right_wrist_rgb, +torso action, "
-            "+gripper obs/action, +base pose obs, +frame capture stamps)"
+            f"{head_keys}+{wrist_keys}, +torso action, "
+            "+gripper obs/action, +base pose obs, +frame capture stamps, "
+            f"camera alignment {'<=' + format(max_camera_skew_ms, 'g') + 'ms' if self._record_max_camera_skew_ns > 0 else 'OFF'})"
         )
 
     def _recording_control_metadata(self) -> dict:
-        """Mode-specific static episode metadata; base WBC behavior adds nothing."""
-        return {}
+        """Static semantics needed to interpret actions, state, and clock fields."""
+        if getattr(self.args, "policy_path", None):
+            control_mode = "policy_rollout"
+        elif getattr(self.args, "replay_episode", None):
+            control_mode = "policy_episode_replay"
+        elif getattr(self.args, "replay", None):
+            control_mode = "wbc_episode_replay"
+        else:
+            control_mode = "wbc_vr_live"
+        arkit_mode = str(getattr(self.args, "arkit_base", "off"))
+        configured_base_source = self.configured_base_pose_source()
+        return {
+            "schema": np.asarray(_RAW_EPISODE_SCHEMA.encode()),
+            "control_mode": np.asarray(control_mode.encode()),
+            "command_source_clock": np.asarray(b"producer_wall_clock"),
+            "local_timing_clock": np.asarray(b"time.time_ns"),
+            "episode_timestamp_semantics": np.asarray(b"record_commit_wall_ns"),
+            "action_target_frame": np.asarray(b"engage_origin_world"),
+            "obs_base_pose_source": np.asarray(configured_base_source.encode()),
+            "base_control_pose_source": np.asarray(configured_base_source.encode()),
+            "arkit_mode": np.asarray(arkit_mode.encode()),
+            # Head contract for action/head (policy action dims 20-28). "fixed" pins the
+            # head at the nominal posture and ik.solve() ignores head_target, so those
+            # dims record where the LEADER looked while the robot head -- and the head
+            # camera -- never move. ``head_actuated`` is recorded alongside because
+            # deciding that needs the --enable mask too, which nothing else writes out:
+            # without it a consumer cannot tell an executed head target from a label the
+            # take never applied.
+            "head_mode": np.asarray(str(self.cfg.head_mode).encode()),
+            "head_actuated": np.bool_(
+                bool(self.enable.get("head", False)) and self.cfg.head_mode != "fixed"
+            ),
+            "gripper_action_semantics": np.asarray(b"latest_fc16_command_sent"),
+            "gripper_command_max_rate_hz": np.float64(_GRIPPER_COMMAND_MAX_RATE_HZ),
+            "arm_cmd_lpf_tau_s": np.float64(
+                getattr(self.args, "arm_cmd_lpf_tau", DEFAULT_ARM_CMD_LPF_TAU)
+            ),
+            "gripper_command_keepalive_s": np.float64(_GRIPPER_COMMAND_KEEPALIVE_S),
+            "gripper_status_write_guard_s": np.float64(_GRIPPER_STATUS_WRITE_GUARD_S),
+            "gripper_status_request_timeout_s": np.float64(_GRIPPER_STATUS_REQUEST_TIMEOUT_S),
+            "gripper_status_pre_read_guard_s": np.float64(_GRIPPER_STATUS_PRE_READ_GUARD_S),
+            "gripper_status_poll_rate_hz": np.float64(1.0 / self._gripper_status_poll_period_s()),
+            "gripper_status_max_age_periods": np.float64(_GRIPPER_STATUS_MAX_AGE_PERIODS),
+            "gripper_status_selection_max_age_periods": np.float64(
+                _GRIPPER_STATUS_MAX_AGE_PERIODS - _GRIPPER_STATUS_COMMIT_MARGIN_PERIODS
+            ),
+            "gripper_status_commit_margin_periods": np.float64(
+                _GRIPPER_STATUS_COMMIT_MARGIN_PERIODS
+            ),
+        }
+
+    def _recording_camera_metadata(self) -> dict:
+        """Serial, firmware, geometry, and launch configuration for all cameras.
+
+        The publisher is the only authority for the pixels that actually arrived. Its
+        ``/info`` response captures resize/crop/depth/tracking flags and the opened SDK
+        device, avoiding reconstruction from a launch command that may be stale.
+        """
+        out: dict = {}
+        for label, sensor_id in (
+            ("head", _HEAD_SENSOR_ID),
+            *((f"{arm}_wrist", sid) for arm, sid in _WRIST_SENSOR_IDS.items()),
+        ):
+            info = self._query_camera_info_response(label, sensor_id)
+            actual = info.get("actual")
+            if not isinstance(actual, dict):
+                raise RuntimeError(f"[wbc_vr_robot] {label} camera /info has no 'actual' geometry")
+            try:
+                serial = int(info["serial_number"])
+                width = int(actual["width"])
+                height = int(actual["height"])
+                fps = float(actual["fps"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"[wbc_vr_robot] malformed {label} camera identity/geometry: {info}"
+                ) from exc
+            if serial <= 0 or width <= 0 or height <= 0 or not np.isfinite(fps) or fps <= 0:
+                raise RuntimeError(
+                    f"[wbc_vr_robot] invalid {label} camera identity/geometry: "
+                    f"serial={serial}, {width}x{height}@{fps}"
+                )
+            status = str(info.get("status", ""))
+            if status.lower() != "running":
+                raise RuntimeError(
+                    f"[wbc_vr_robot] {label} camera publisher status is {status!r}, "
+                    "expected 'running'"
+                )
+            out[label] = {
+                "sensor_id": np.asarray(sensor_id.encode()),
+                "camera_id": np.asarray(str(info.get("camera_id", serial)).encode()),
+                "serial_number": np.int64(serial),
+                "model": np.asarray(str(info.get("model", "unknown")).encode()),
+                "firmware_version": np.asarray(
+                    str(info.get("firmware_version", "unknown")).encode()
+                ),
+                "status": np.asarray(status.encode()),
+                "actual": {
+                    "width": np.int64(width),
+                    "height": np.int64(height),
+                    "fps": np.float64(fps),
+                },
+                "configured_json": _json_bytes(info.get("configured", {})),
+                "streams_json": _json_bytes(info.get("streams", {})),
+                **camera_resolution_metadata(info.get("configured", {}), actual),
+            }
+        return out
+
+    def _recording_provenance_metadata(self) -> dict:
+        """Self-contained executable/config snapshot for exact take reproduction."""
+        import importlib.metadata
+        import os
+        import platform
+        import socket
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parents[1]
+
+        def git(*git_args: str) -> str:
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(repo), *git_args],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return ""
+            return result.stdout.strip() if result.returncode == 0 else ""
+
+        source_paths = {
+            "wbc_vr_robot": Path(__file__).resolve(),
+            "wbc_vr_leader": repo / "scripts/wbc_vr_leader.py",
+            "wbc_teleop": repo / "src/omniteleop/wbc_teleop.py",
+            "base_closed_loop": repo / "src/omniteleop/follower/base_closed_loop.py",
+            "whole_body_ik": repo / "src/omniteleop/follower/whole_body_ik.py",
+            "wbik_yaml": Path(DEFAULT_CONFIG_PATH).resolve(),
+            "head_zed_publisher": repo / "scripts/publish_head_camera.py",
+            "wrist_zed_publisher": repo / "scripts/publish_wrist_camera.py",
+            "robot_urdf": Path(self.cfg.urdf_path),
+            "gripper_collision": repo / "src/omniteleop/follower/gripper_collision.py",
+            "gripper_stroke": repo / "src/omniteleop/follower/robotiq_stroke_0925.json",
+            "camera_motion_recorder": repo / "src/omniteleop/common/camera_motion_recorder.py",
+            "native_state_recorder": repo / "src/omniteleop/common/native_state_recorder.py",
+            "camera_resolution": repo / "src/omniteleop/common/camera_resolution.py",
+            "arkit_base": repo / "src/omniteleop/follower/arkit_base.py",
+            "base_pose_publisher": repo / "scripts/base_tracking/base_pose_pub.py",
+            "robotiq": repo / "src/omniteleop/follower/robotiq.py",
+        }
+        source_snapshot: dict = {}
+        for label, path in source_paths.items():
+            if not path.is_file():
+                raise RuntimeError(f"[wbc_vr_robot] provenance source file is missing: {path}")
+            content = path.read_bytes()
+            source_snapshot[label] = {
+                "path": np.asarray(
+                    str(path.relative_to(repo) if path.is_relative_to(repo) else path).encode()
+                ),
+                "sha256": np.asarray(_sha256_file(path).encode()),
+                # Exact dirty-worktree content makes the hash actionable even when the
+                # git commit alone cannot reproduce this run.
+                "content": np.asarray(content),
+            }
+
+        versions: dict[str, str] = {}
+        for package in ("omniteleop", "dexcomm", "dexcontrol", "numpy", "h5py", "pink"):
+            try:
+                versions[package] = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                versions[package] = "not-installed-as-distribution"
+
+        args_dict = dict(vars(self.args))
+        cfg_dict = asdict(self.cfg)
+        tracked_status = git("status", "--porcelain=v1", "--untracked-files=no")
+        return {
+            "schema": np.asarray(_RAW_EPISODE_SCHEMA.encode()),
+            "captured_at_ns": np.int64(time.time_ns()),
+            "git_commit": np.asarray((git("rev-parse", "HEAD") or "unknown").encode()),
+            "git_tracked_dirty": np.bool_(bool(tracked_status)),
+            "git_tracked_status": np.asarray(tracked_status.encode()),
+            "argv_json": _json_bytes(sys.argv),
+            "parsed_args_json": _json_bytes(args_dict),
+            "wbc_config_json": _json_bytes(cfg_dict),
+            "software_versions_json": _json_bytes(versions),
+            "host": {
+                "hostname": np.asarray(socket.gethostname().encode()),
+                "platform": np.asarray(platform.platform().encode()),
+                "python_version": np.asarray(platform.python_version().encode()),
+                "python_executable": np.asarray(sys.executable.encode()),
+            },
+            "robot": {
+                "robot_name": np.asarray(os.getenv("ROBOT_NAME", "").encode()),
+                "namespace": np.asarray(str(getattr(self.args, "namespace", "")).encode()),
+            },
+            "source_snapshot": source_snapshot,
+        }
 
     def _query_ntp_calibration(self) -> dict:
         """Robot->workstation clock offset, stored once per run as ``meta/ntp``.
 
         ``offset_ns`` follows dexcontrol's NTP convention (server minus client, i.e.
-        robot SoC clock minus this machine's clock). ZED image stamps are produced by the
+        robot SoC clock minus THIS machine's clock). This is preserved for diagnostics
+        and as a legacy fallback in the audit tool. ZED image stamps are produced by the
         standalone camera publishers, so authoritative absolute camera staleness uses
         ``meta/camera_ntp`` from :meth:`_query_camera_clock_calibrations`.
 
@@ -1292,6 +2507,46 @@ class HardwareDriver:
             "rtt_ns": np.int64(round(rtt * 1e9)),
             "queried_at_ns": np.int64(time.time_ns()),
         }
+
+    # A workstation clock that is still being disciplined moves between takes. Measured
+    # 2026-09-03 on xarm-workstation (systemd-timesyncd against an internet server with
+    # 224 ms jitter): the robot-minus-workstation offset went from -411 ms to -338 ms in
+    # 25 min, i.e. the camera-age gate saw every camera ~200 ms "late" and aborted the
+    # first take of the run because the offsets had been measured once at startup.
+    # Anything beyond this many ms since the previous measurement is worth a warning:
+    # it is far above the 2-3 ms the LAN round trip can explain.
+    _CAMERA_CLOCK_DRIFT_WARN_MS = 20.0
+
+    def _refresh_camera_clock_offsets(self) -> None:
+        """Re-measure camera-host clock offsets at every episode start.
+
+        ``_init_recording`` measures them once; the age gate and ``meta/camera_ntp`` then
+        assume they hold for the whole run. They do not when the workstation clock is
+        being slewed, so re-query at each take, store the fresh calibration in this
+        episode's static metadata, and report how far the offsets moved.
+        """
+        static = getattr(self, "_record_static", None)
+        offsets = getattr(self, "_camera_clock_offsets_ns", None)
+        if static is None or offsets is None:
+            return  # recording metadata was never initialised (not --record)
+        camera_ntp = self._query_camera_clock_calibrations()
+        fresh = {label: int(np.asarray(camera_ntp[label]["offset_ns"])) for label in offsets}
+        drift_ms = {label: (fresh[label] - offsets[label]) / 1e6 for label in offsets}
+        worst = max(abs(v) for v in drift_ms.values())
+        detail = ", ".join(f"{k}={v:+.1f}ms" for k, v in drift_ms.items())
+        if worst > self._CAMERA_CLOCK_DRIFT_WARN_MS:
+            print(
+                f"[wbc_vr_robot] WARNING: camera clock offsets moved {detail} since the "
+                "previous measurement. The workstation clock is being slewed (check "
+                "`timedatectl timesync-status`; sync it to the robot over the LAN). "
+                "Using the fresh offsets for this take; a long take can still drift past "
+                "--record-max-camera-age-ms."
+            )
+        else:
+            print(f"[wbc_vr_robot] camera clock offsets refreshed ({detail})")
+        self._camera_clock_offsets_ns = fresh
+        static["meta"]["camera_ntp"] = camera_ntp
+        self._episode.set_static(static)
 
     def _query_camera_clock_calibrations(self) -> dict:
         """Camera-publisher-host clock offsets, stored under ``meta/camera_ntp``.
@@ -1395,19 +2650,20 @@ class HardwareDriver:
         )
         return cal
 
-    def _query_head_stereo_calibration(self, *, require_right: bool) -> dict:
-        """Return the live rectified head calibration for the published stereo frames.
-
-        The publisher has already applied its crop/resize to these matrices, so its
-        ``left_K`` is authoritative for every recording mode.
-        """
+    def _query_camera_info_response(self, label: str, sensor_id: str) -> dict:
+        """Query and cache one camera publisher's authoritative ``/info`` response."""
+        cache = getattr(self, "_camera_info_responses", None)
+        if cache is None:
+            cache = self._camera_info_responses = {}
+        if sensor_id in cache:
+            return cache[sensor_id]
         node = getattr(self.robot, "_node", None)
         if node is None:
             raise RuntimeError(
-                "[wbc_vr_robot] --record requires a DexComm node to query the head "
-                "camera calibration."
+                f"[wbc_vr_robot] recording requires a DexComm node to query "
+                f"the {label} camera's calibration."
             )
-        topic = f"sensors/{_HEAD_SENSOR_ID}/info"
+        topic = f"sensors/{sensor_id}/info"
         try:
             client = node.create_service_client(
                 service_name=topic,
@@ -1418,13 +2674,21 @@ class HardwareDriver:
             response = client.call({})
         except Exception as exc:
             raise RuntimeError(
-                f"[wbc_vr_robot] cannot query head camera info {topic!r}: "
+                f"[wbc_vr_robot] cannot query {label} stereo info {topic!r}: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
         if not isinstance(response, dict):
             raise RuntimeError(
                 f"[wbc_vr_robot] {topic!r} returned {type(response).__name__}, expected dict."
             )
+        cache[sensor_id] = response
+        return response
+
+    def _query_stereo_calibration(
+        self, label: str, sensor_id: str, *, require_right: bool = True
+    ) -> dict:
+        """Return one publisher's live calibration for its rectified output frames."""
+        response = self._query_camera_info_response(label, sensor_id)
 
         streams = response.get("streams")
         right_stream = streams.get("right_rgb") if isinstance(streams, dict) else None
@@ -1432,27 +2696,31 @@ class HardwareDriver:
             not isinstance(right_stream, dict) or not right_stream.get("enabled", False)
         ):
             raise RuntimeError(
-                "[wbc_vr_robot] --head-right-rgb requested, but the head publisher "
-                "reports right_rgb disabled. Restart scripts/publish_head_camera.py with "
-                "--no-skip-right-rgb."
+                f"[wbc_vr_robot] {label} publisher reports right_rgb disabled. Restart "
+                "its ZED publisher with --no-skip-right-rgb."
             )
 
         stereo = response.get("stereo")
         if not isinstance(stereo, dict):
+            topic = f"sensors/{sensor_id}/info"
             raise RuntimeError(
                 f"[wbc_vr_robot] {topic!r} has no 'stereo' block. Start the publisher "
                 "from a build that serves rectified baseline and per-eye intrinsics."
             )
         if not stereo.get("rectified", False):
             raise RuntimeError(
-                "[wbc_vr_robot] head stereo calibration is not rectified; "
+                f"[wbc_vr_robot] {label} stereo calibration is not rectified; "
                 "FoundationStereo requires row-aligned rectified views."
             )
         baseline_m = float(stereo.get("baseline_m", np.nan))
         if not np.isfinite(baseline_m) or not 0.01 < baseline_m < 0.5:
-            raise ValueError(f"[wbc_vr_robot] implausible head stereo baseline {baseline_m} m.")
+            raise ValueError(f"[wbc_vr_robot] implausible {label} stereo baseline {baseline_m} m.")
 
-        out: dict = {"baseline_m": np.float32(baseline_m)}
+        out: dict = {
+            "baseline_m": np.float32(baseline_m),
+            "rectified": np.bool_(True),
+            "sensor_id": np.asarray(sensor_id.encode()),
+        }
         for eye in ("left_K", "right_K"):
             K = np.asarray(stereo.get(eye), dtype=np.float32)
             if (
@@ -1463,20 +2731,39 @@ class HardwareDriver:
                 or not np.allclose(K[2], (0.0, 0.0, 1.0), atol=1e-6)
             ):
                 raise ValueError(
-                    f"[wbc_vr_robot] head stereo {eye} is not a finite pinhole 3x3 matrix: {K!r}."
+                    f"[wbc_vr_robot] {label} stereo {eye} is not a finite pinhole 3x3 "
+                    f"matrix: {K!r}."
                 )
             out[eye] = K
 
+        return out
+
+    def _query_head_stereo_calibration(self, *, require_right: bool = True) -> dict:
+        """Return live rectified head calibration for the exact published pixels."""
+        out = self._query_stereo_calibration("head", _HEAD_SENSOR_ID, require_right=require_right)
         print(
             f"[wbc_vr_robot] Head stereo calibration: baseline "
-            f"{baseline_m * 1000:.2f} mm, left fx {float(out['left_K'][0, 0]):.2f} px "
+            f"{float(out['baseline_m']) * 1000:.2f} mm, "
+            f"left fx {float(out['left_K'][0, 0]):.2f} px "
             "-> obs/images/intrinsic + meta/head_stereo"
         )
         return out
 
-    @staticmethod
-    def _unwrap_frame(name: str, entry) -> tuple[np.ndarray, int]:
-        """Split a ``get_obs(include_timestamp=True)`` stream entry into ``(array, frame_ns)``.
+    def _query_wrist_stereo_calibrations(self) -> dict[str, dict]:
+        """Return per-arm live calibration for both wrist ZED-M publishers."""
+        out: dict[str, dict] = {}
+        for arm, sensor_id in _WRIST_SENSOR_IDS.items():
+            out[arm] = self._query_stereo_calibration(f"{arm}_wrist", sensor_id)
+            print(
+                f"[wbc_vr_robot] {arm.capitalize()} wrist stereo calibration: baseline "
+                f"{float(out[arm]['baseline_m']) * 1000:.2f} mm, "
+                f"left fx {float(out[arm]['left_K'][0, 0]):.2f} px "
+                f"-> meta/wrist_stereo/{arm}"
+            )
+        return out
+
+    def _unwrap_frame_sample(self, name: str, entry) -> tuple[np.ndarray, int, int]:
+        """Return ``(array, capture_ns, local_receive_ns)`` for one stream entry.
 
         The dexcontrol ZED sensor returns ``{"data": arr, "timestamp_ns": int, ...}`` per
         stream over Zenoh. ``frame_ns`` is the publisher's capture wall-clock, unique per
@@ -1495,9 +2782,33 @@ class HardwareDriver:
         if ts is None or int(ts) <= 0:
             raise ValueError(
                 f"[wbc_vr_robot] {name} frame has no valid timestamp_ns ({ts!r}); cannot "
-                "verify frame freshness. Ensure the ZED-SDK publisher stamps frames."
+                "verify frame freshness. Ensure the ZED-SDK publisher stamps frames "
+                "(tests/test_head_zedx_depth.py / test_wrist_zedm_depth.py, Zenoh transport)."
             )
-        return entry["data"], int(ts)
+        receive_ns = entry.get("receive_time_ns")
+        if receive_ns is None or int(receive_ns) <= 0:
+            if bool(getattr(getattr(self, "args", None), "record", False)):
+                raise ValueError(
+                    f"[wbc_vr_robot] {name} frame has no valid receive_time_ns "
+                    f"({receive_ns!r}); cannot separate transport/decode latency from "
+                    "subscriber-cache age. Install dexcomm >= 0.4.6."
+                )
+            receive_ns = -1
+        else:
+            receive_ns = int(receive_ns)
+            if receive_ns > time.time_ns() + 1_000_000_000:
+                raise ValueError(
+                    f"[wbc_vr_robot] {name} receive_time_ns {receive_ns} is in the future"
+                )
+            if not hasattr(self, "_last_camera_receive_ns"):
+                self._last_camera_receive_ns = {}
+            self._last_camera_receive_ns[name] = receive_ns
+        return entry["data"], int(ts), int(receive_ns)
+
+    def _unwrap_frame(self, name: str, entry) -> tuple[np.ndarray, int]:
+        """Backward-compatible ``(array, capture_ns)`` view of one camera sample."""
+        data, capture_ns, _receive_ns = self._unwrap_frame_sample(name, entry)
+        return data, capture_ns
 
     def _grab_head_images(
         self,
@@ -1567,12 +2878,112 @@ class HardwareDriver:
         depth = np.asarray(depth)
         if depth.ndim != 2:
             raise ValueError(f"[wbc_vr_robot] head_camera depth shape {depth.shape} is not (H,W).")
-        # Metres -> millimetres, clipped to uint16 for compact storage.
+        # meters -> millimeters, clipped to uint16 (matches vr_reader's head_depth).
         depth_u16 = np.clip(depth * 1000, 0, 65535).astype(np.uint16)
         return left_rgb, depth_u16, frame_ns, depth_ns, right_rgb, right_ns
 
-    def _grab_head_rgb(self) -> Optional[tuple[np.ndarray, int]]:
-        """Poll only head RGB for a 2-D recording freshness check.
+    def _grab_head_alignment_sample(self) -> Optional[_HeadAlignmentSample]:
+        """Return one new, stereo-coherent head sample for the alignment history.
+
+        This path first inspects capture stamps and only copies image arrays when the
+        left-eye capture is distinct. Polling it at the 100 Hz control rate therefore
+        does not copy two 600x960 RGB arrays on every cache read. When stereo is
+        requested, an independently delivered half-pair is held out until both eyes
+        expose the exact same physical-capture stamp.
+        """
+        want_depth = not bool(getattr(self.args, "no_head_depth", False))
+        want_right = bool(getattr(self.args, "head_right_rgb", False))
+        obs_keys = ["left_rgb"]
+        if want_right:
+            obs_keys.append("right_rgb")
+        if want_depth:
+            obs_keys.append("depth")
+        obs = self.robot.sensors.head_camera.get_obs(
+            obs_keys=obs_keys,
+            include_timestamp=True,
+        )
+        left_entry = obs.get("left_rgb")
+        right_entry = obs.get("right_rgb") if want_right else None
+        depth_entry = obs.get("depth") if want_depth else None
+        if (
+            left_entry is None
+            or (want_right and right_entry is None)
+            or (want_depth and depth_entry is None)
+        ):
+            return None
+
+        left_data, left_ns, left_receive_ns = self._unwrap_frame_sample(
+            "head_camera left_rgb", left_entry
+        )
+        last_ns = int(getattr(self, "_last_buffered_head_ns", -1))
+        if left_ns < last_ns:
+            raise RuntimeError(
+                "[wbc_vr_robot] --record: BACKWARD CAMERA CLOCK STEP -- head moved "
+                f"backward {(last_ns - left_ns) / 1e6:.3f} ms "
+                f"(previous buffered={last_ns}, current={left_ns}). No regressed "
+                "frame was recorded; verify chrony and restart the publisher before "
+                "collecting again."
+            )
+        if left_ns == last_ns:
+            return None
+
+        right_data = None
+        right_ns = None
+        right_receive_ns = None
+        if want_right:
+            right_data, right_ns, right_receive_ns = self._unwrap_frame_sample(
+                "head_camera right_rgb", right_entry
+            )
+            if right_ns != left_ns:
+                # Left and right are independent Zenoh messages. Keep polling until the
+                # cache contains a completed physical pair; never buffer a mixed pair.
+                return None
+
+        left_rgb = np.asarray(left_data)
+        if left_rgb.ndim != 3 or left_rgb.shape[2] != 3:
+            raise ValueError(
+                f"[wbc_vr_robot] head_camera left_rgb shape {left_rgb.shape} is not (H,W,3)."
+            )
+        left_rgb = np.ascontiguousarray(left_rgb, dtype=np.uint8)
+        right_rgb = None
+        if right_data is not None:
+            right_rgb = np.asarray(right_data)
+            if right_rgb.shape != left_rgb.shape:
+                raise ValueError(
+                    f"[wbc_vr_robot] head_camera right_rgb shape {right_rgb.shape} != "
+                    f"left_rgb {left_rgb.shape}; the publisher must apply the same "
+                    "--crop/--resize to both eyes."
+                )
+            right_rgb = np.ascontiguousarray(right_rgb, dtype=np.uint8)
+
+        depth_u16 = None
+        depth_ns = None
+        depth_receive_ns = None
+        if want_depth:
+            depth_data, depth_ns, depth_receive_ns = self._unwrap_frame_sample(
+                "head_camera depth", depth_entry
+            )
+            depth = np.asarray(depth_data)
+            if depth.ndim != 2:
+                raise ValueError(
+                    f"[wbc_vr_robot] head_camera depth shape {depth.shape} is not (H,W)."
+                )
+            depth_u16 = np.clip(depth * 1000, 0, 65535).astype(np.uint16)
+
+        return _HeadAlignmentSample(
+            left_rgb=left_rgb,
+            depth_u16=depth_u16,
+            left_capture_ns=int(left_ns),
+            depth_capture_ns=None if depth_ns is None else int(depth_ns),
+            right_rgb=right_rgb,
+            right_capture_ns=None if right_ns is None else int(right_ns),
+            left_receive_ns=int(left_receive_ns),
+            depth_receive_ns=(None if depth_receive_ns is None else int(depth_receive_ns)),
+            right_receive_ns=(None if right_receive_ns is None else int(right_receive_ns)),
+        )
+
+    def _grab_head_rgb_sample(self) -> Optional[tuple[np.ndarray, int, int]]:
+        """Poll head RGB -> image, publisher capture, and exact local receive stamp.
 
         Recording, SceneDiff, and ManiFlow still use :meth:`_grab_head_images`.
         LeRobot RGB policies call this lightweight path while waiting for a new
@@ -1584,22 +2995,27 @@ class HardwareDriver:
         entry = obs.get("left_rgb")
         if entry is None:
             return None
-        left_rgb, frame_ns = self._unwrap_frame("head_camera left_rgb", entry)
+        left_rgb, frame_ns, receive_ns = self._unwrap_frame_sample("head_camera left_rgb", entry)
         left_rgb = np.asarray(left_rgb)
         if left_rgb.ndim != 3 or left_rgb.shape[2] != 3:
             raise ValueError(
                 f"[wbc_vr_robot] head_camera left_rgb shape {left_rgb.shape} is not (H,W,3)."
             )
-        return np.ascontiguousarray(left_rgb, dtype=np.uint8), frame_ns
+        return np.ascontiguousarray(left_rgb, dtype=np.uint8), frame_ns, receive_ns
 
-    def _grab_wrist_image(self, arm: str) -> Optional[tuple[np.ndarray, int]]:
-        """Poll one arm's wrist ZED-M -> ``(<arm>_wrist_rgb uint8 HxWx3, frame_ns)`` or None.
+    def _grab_head_rgb(self) -> Optional[tuple[np.ndarray, int]]:
+        """Backward-compatible image/capture view used outside policy instrumentation."""
+        sample = self._grab_head_rgb_sample()
+        return None if sample is None else (sample[0], sample[1])
+
+    def _grab_wrist_image_sample(self, arm: str) -> Optional[tuple[np.ndarray, int, int]]:
+        """Poll one wrist left eye -> image, publisher capture, local receive stamp.
 
         ``arm`` is "left" or "right" and names the ARM the camera is mounted on; the stream
         pulled is always that camera's stereo LEFT eye (``_WRIST_OBS_KEY``).
 
-        Consumes the publisher's frame as-is; the wrist ZED-SDK publisher already resized
-        it on the camera host.
+        Consumes the publisher's frame AS-IS (no crop/resize), like vr_reader: the wrist
+        ZED-SDK publisher (tests/test_wrist_zedm_depth.py) already resized robot-side.
         Returns None until a frame arrives. ``frame_ns`` is the publisher capture timestamp
         (``include_timestamp=True``); record_tick rejects a stale frame (publisher stalled
         below the record rate). A momentary drop is deliberately NOT papered over with a
@@ -1611,20 +3027,553 @@ class HardwareDriver:
             obs_keys=[_WRIST_OBS_KEY], include_timestamp=True
         )
         entry = obs.get(_WRIST_OBS_KEY)
-        if entry is None:  # tolerate a sensor-name-prefixed key
+        if entry is None:  # tolerate a sensor-name-prefixed key (mirrors policy_rollout)
             for key, val in obs.items():
                 if key.endswith("_" + _WRIST_OBS_KEY):
                     entry = val
                     break
         if entry is None:
             return None  # publisher delivered no frame this poll
-        wrist, frame_ns = self._unwrap_frame(f"{sensor_id} {_WRIST_OBS_KEY}", entry)
+        wrist, frame_ns, receive_ns = self._unwrap_frame_sample(
+            f"{sensor_id} {_WRIST_OBS_KEY}", entry
+        )
         wrist = np.asarray(wrist)
         if wrist.ndim != 3 or wrist.shape[2] != 3:
             raise ValueError(
                 f"[wbc_vr_robot] {sensor_id} {_WRIST_OBS_KEY} shape {wrist.shape} is not (H,W,3)."
             )
-        return np.ascontiguousarray(wrist, dtype=np.uint8), frame_ns
+        return np.ascontiguousarray(wrist, dtype=np.uint8), frame_ns, receive_ns
+
+    def _grab_wrist_image(self, arm: str) -> Optional[tuple[np.ndarray, int]]:
+        """Backward-compatible image/capture view used by recording and replay."""
+        sample = self._grab_wrist_image_sample(arm)
+        return None if sample is None else (sample[0], sample[1])
+
+    def _grab_wrist_stereo_sample(
+        self, arm: str
+    ) -> Optional[tuple[np.ndarray, int, int, np.ndarray, int, int]]:
+        """Poll both wrist eyes with exact capture and local-receive stamps.
+
+        The existing ``<arm>_wrist_rgb`` dataset remains the stereo LEFT eye for
+        backward compatibility.  The returned right eye is recorded separately as
+        ``<arm>_wrist_right_rgb`` when ``--wrist-right-rgb`` is selected.
+        """
+        sensor_id = _WRIST_SENSOR_IDS[arm]
+        obs = getattr(self.robot.sensors, sensor_id).get_obs(
+            obs_keys=["left_rgb", "right_rgb"], include_timestamp=True
+        )
+
+        def find_entry(stream: str):
+            entry = obs.get(stream)
+            if entry is None:  # tolerate sensor-name-prefixed transport keys
+                for key, value in obs.items():
+                    if key.endswith("_" + stream):
+                        return value
+            return entry
+
+        left_entry = find_entry("left_rgb")
+        right_entry = find_entry("right_rgb")
+        if left_entry is None or right_entry is None:
+            return None
+
+        left_rgb, left_ns, left_receive_ns = self._unwrap_frame_sample(
+            f"{sensor_id} left_rgb", left_entry
+        )
+        right_rgb, right_ns, right_receive_ns = self._unwrap_frame_sample(
+            f"{sensor_id} right_rgb", right_entry
+        )
+        left_rgb = np.asarray(left_rgb)
+        right_rgb = np.asarray(right_rgb)
+        if left_rgb.ndim != 3 or left_rgb.shape[2] != 3:
+            raise ValueError(
+                f"[wbc_vr_robot] {sensor_id} left_rgb shape {left_rgb.shape} is not (H,W,3)."
+            )
+        if right_rgb.shape != left_rgb.shape:
+            raise ValueError(
+                f"[wbc_vr_robot] {sensor_id} right_rgb shape {right_rgb.shape} != "
+                f"left_rgb {left_rgb.shape}; the publisher must apply the same "
+                "--crop/--resize to both eyes."
+            )
+        return (
+            np.ascontiguousarray(left_rgb, dtype=np.uint8),
+            left_ns,
+            left_receive_ns,
+            np.ascontiguousarray(right_rgb, dtype=np.uint8),
+            right_ns,
+            right_receive_ns,
+        )
+
+    def _grab_wrist_stereo(self, arm: str) -> Optional[tuple[np.ndarray, int, np.ndarray, int]]:
+        """Backward-compatible stereo image/capture view."""
+        sample = self._grab_wrist_stereo_sample(arm)
+        if sample is None:
+            return None
+        return sample[0], sample[1], sample[3], sample[4]
+
+    def _camera_alignment_enabled(self) -> bool:
+        """Whether record rows use head-anchored capture-nearest wrist frames."""
+        return int(getattr(self, "_record_max_camera_skew_ns", 0)) > 0
+
+    def _capture_local_ns(self, label: str, capture_ns: int) -> int:
+        """Map one camera-host capture stamp onto this process's wall clock."""
+        offsets = getattr(self, "_camera_clock_offsets_ns", {})
+        if label not in offsets:
+            raise RuntimeError(
+                f"[wbc_vr_robot] no camera clock offset for {label!r}; cannot align "
+                "multi-camera captures"
+            )
+        # camera offset = camera_host - local, hence local = camera - offset.
+        return int(capture_ns) - int(offsets[label])
+
+    def _poll_camera_alignment_buffers(self) -> None:
+        """Cache every distinct coherent camera frame at the control cadence.
+
+        This reads only dexcontrol's decoded latest-frame subscriber caches. It never
+        blocks for a frame and never asks the publishers for additional work. Stereo
+        samples enter history only when both eyes share the exact physical-capture stamp
+        required by FoundationStereo.
+        """
+        if not self._camera_alignment_enabled():
+            return
+        poll_lock = getattr(self, "_wrist_alignment_poll_lock", None)
+        if poll_lock is None:
+            self._wrist_alignment_poll_lock = threading.Lock()
+            poll_lock = self._wrist_alignment_poll_lock
+        with poll_lock:
+            self._poll_camera_alignment_buffers_once()
+
+    def _poll_wrist_alignment_buffers(self) -> None:
+        """Compatibility alias for callers predating buffered head selection."""
+        self._poll_camera_alignment_buffers()
+
+    def _poll_camera_alignment_buffers_once(self) -> None:
+        """One serialized three-camera cache poll; caller holds the poll lock."""
+        head_sample = self._grab_head_alignment_sample()
+        if head_sample is not None:
+            capture_ns = int(head_sample.left_capture_ns)
+            alignment_lock = getattr(self, "_wrist_alignment_lock", None)
+            if alignment_lock is None:
+                self._wrist_alignment_lock = threading.Lock()
+                alignment_lock = self._wrist_alignment_lock
+            with alignment_lock:
+                last_seen_ns = int(getattr(self, "_last_buffered_head_ns", -1))
+                if capture_ns < last_seen_ns:
+                    raise RuntimeError(
+                        "[wbc_vr_robot] --record: BACKWARD CAMERA CLOCK STEP -- head "
+                        f"moved backward {(last_seen_ns - capture_ns) / 1e6:.3f} ms "
+                        f"(previous buffered={last_seen_ns}, current={capture_ns}). "
+                        "No regressed frame was recorded; verify chrony and restart "
+                        "the publisher before collecting again."
+                    )
+                if capture_ns > last_seen_ns:
+                    self._last_buffered_head_ns = capture_ns
+                    self._head_alignment_buffer.append(head_sample)
+
+        want_right = bool(getattr(self.args, "wrist_right_rgb", False))
+        for arm in _WRIST_SENSOR_IDS:
+            if want_right:
+                stereo = self._grab_wrist_stereo_sample(arm)
+                if stereo is None:
+                    continue
+                sample = stereo
+                if int(sample[1]) != int(sample[4]):
+                    # Independently delivered eyes can be momentarily one cache update
+                    # apart. Do not poison the history; the next 100 Hz poll can observe
+                    # the completed pair. Persistent mismatch becomes an alignment timeout.
+                    continue
+            else:
+                mono = self._grab_wrist_image_sample(arm)
+                if mono is None:
+                    continue
+                sample = (mono[0], int(mono[1]), int(mono[2]), None, None, None)
+
+            capture_ns = int(sample[1])
+            alignment_lock = getattr(self, "_wrist_alignment_lock", None)
+            if alignment_lock is None:
+                self._wrist_alignment_lock = threading.Lock()
+                alignment_lock = self._wrist_alignment_lock
+            with alignment_lock:
+                last_seen_ns = int(self._last_buffered_wrist_ns[arm])
+                if capture_ns < last_seen_ns:
+                    raise RuntimeError(
+                        "[wbc_vr_robot] --record: BACKWARD CAMERA CLOCK STEP -- "
+                        f"{arm}_wrist moved backward "
+                        f"{(last_seen_ns - capture_ns) / 1e6:.3f} ms "
+                        f"(previous buffered={last_seen_ns}, current={capture_ns}). "
+                        "No regressed frame was recorded; verify chrony and restart the "
+                        "publisher before collecting again."
+                    )
+                if capture_ns == last_seen_ns:
+                    continue
+                self._last_buffered_wrist_ns[arm] = capture_ns
+                self._wrist_alignment_buffers[arm].append(sample)
+
+    def _poll_wrist_alignment_buffers_once(self) -> None:
+        """Compatibility alias; caller must hold the shared poll lock."""
+        self._poll_camera_alignment_buffers_once()
+
+    def _select_aligned_camera_samples(
+        self,
+        *,
+        arms=None,
+        last_head_ns: Optional[int] = None,
+        last_wrist_ns: Optional[dict[str, int]] = None,
+        max_skew_ns: Optional[int] = None,
+    ) -> tuple[
+        Optional[_HeadAlignmentSample],
+        Optional[dict[str, tuple]],
+        dict[str, int],
+    ]:
+        """Choose the freshest unused head anchor with a coherent wrist set.
+
+        The newest head cache entry is not always selectable: at 30 Hz it can arrive
+        before the corresponding 15 Hz wrist frames and remain more than one skew limit
+        ahead. Trying buffered head anchors newest-to-oldest avoids that phase-chasing
+        failure while keeping every selected capture strictly newer than this consumer's
+        own cursors. The returned head sample is the diagnostic newest candidate when no
+        full set is currently valid; in that case wrist samples are ``None``.
+        """
+        selected_arms = tuple(_WRIST_SENSOR_IDS if arms is None else arms)
+        unknown_arms = sorted(set(selected_arms) - set(_WRIST_SENSOR_IDS))
+        if unknown_arms:
+            raise ValueError(f"unknown wrist arm(s) for camera alignment: {unknown_arms}")
+        head_used = int(self._last_rec_head_ns) if last_head_ns is None else int(last_head_ns)
+        wrist_used = self._last_rec_wrist_ns if last_wrist_ns is None else last_wrist_ns
+        limit_ns = int(self._record_max_camera_skew_ns) if max_skew_ns is None else int(max_skew_ns)
+        alignment_lock = getattr(self, "_wrist_alignment_lock", None)
+        if alignment_lock is None:
+            head_history = list(self._head_alignment_buffer)
+            wrist_histories = {
+                arm: list(self._wrist_alignment_buffers[arm]) for arm in selected_arms
+            }
+        else:
+            with alignment_lock:
+                head_history = list(self._head_alignment_buffer)
+                wrist_histories = {
+                    arm: list(self._wrist_alignment_buffers[arm]) for arm in selected_arms
+                }
+        head_candidates = [
+            sample for sample in reversed(head_history) if int(sample.left_capture_ns) > head_used
+        ]
+        if not head_candidates:
+            return None, None, {}
+
+        newest_skew_ns: dict[str, int] = {}
+        for candidate_index, head_sample in enumerate(head_candidates):
+            head_local_ns = self._capture_local_ns("head", int(head_sample.left_capture_ns))
+            selected: dict[str, tuple] = {}
+            skew_ns: dict[str, int] = {}
+            for arm in selected_arms:
+                candidates = [
+                    sample
+                    for sample in wrist_histories[arm]
+                    if int(sample[1]) > int(wrist_used.get(arm, -1))
+                ]
+                if not candidates:
+                    continue
+                label = f"{arm}_wrist"
+                best = min(
+                    candidates,
+                    key=lambda sample: (
+                        abs(head_local_ns - self._capture_local_ns(label, int(sample[1]))),
+                        -int(sample[1]),
+                    ),
+                )
+                skew = head_local_ns - self._capture_local_ns(label, int(best[1]))
+                skew_ns[arm] = int(skew)
+                if abs(skew) <= limit_ns:
+                    selected[arm] = best
+            if candidate_index == 0:
+                newest_skew_ns = skew_ns
+            if len(selected) == len(selected_arms):
+                return head_sample, selected, skew_ns
+        return head_candidates[0], None, newest_skew_ns
+
+    def _select_aligned_wrist_samples(
+        self,
+        head_ns: int,
+        *,
+        arms=None,
+        last_used_ns: Optional[dict[str, int]] = None,
+        max_skew_ns: Optional[int] = None,
+    ) -> tuple[Optional[dict[str, tuple]], dict[str, int]]:
+        """Select each arm's closest unused capture to ``head_ns``.
+
+        Returns ``(samples, skew_ns)`` where skew is corrected
+        ``head_capture_local - wrist_capture_local``. ``samples`` is ``None`` if an arm
+        has no unused history or its closest candidate exceeds the configured limit.
+        Selection is non-consuming: recorder and policy-inference consumers keep
+        independent freshness cursors while the bounded deque ages old frames out.
+        """
+        selected_arms = tuple(_WRIST_SENSOR_IDS if arms is None else arms)
+        unknown_arms = sorted(set(selected_arms) - set(_WRIST_SENSOR_IDS))
+        if unknown_arms:
+            raise ValueError(f"unknown wrist arm(s) for camera alignment: {unknown_arms}")
+        used = self._last_rec_wrist_ns if last_used_ns is None else last_used_ns
+        limit_ns = int(self._record_max_camera_skew_ns) if max_skew_ns is None else int(max_skew_ns)
+        alignment_lock = getattr(self, "_wrist_alignment_lock", None)
+        if alignment_lock is None:
+            histories = {arm: list(self._wrist_alignment_buffers[arm]) for arm in selected_arms}
+        else:
+            with alignment_lock:
+                histories = {arm: list(self._wrist_alignment_buffers[arm]) for arm in selected_arms}
+        head_local_ns = self._capture_local_ns("head", int(head_ns))
+        selected: dict[str, tuple] = {}
+        skew_ns: dict[str, int] = {}
+        for arm in selected_arms:
+            candidates = [
+                sample for sample in histories[arm] if int(sample[1]) > int(used.get(arm, -1))
+            ]
+            if not candidates:
+                continue
+            label = f"{arm}_wrist"
+            best = min(
+                candidates,
+                key=lambda sample: (
+                    abs(head_local_ns - self._capture_local_ns(label, int(sample[1]))),
+                    -int(sample[1]),
+                ),
+            )
+            skew = head_local_ns - self._capture_local_ns(label, int(best[1]))
+            skew_ns[arm] = int(skew)
+            if abs(skew) <= limit_ns:
+                selected[arm] = best
+        if len(selected) != len(selected_arms):
+            return None, skew_ns
+        return selected, skew_ns
+
+    def _record_camera_startup_ready(self, now: float) -> bool:
+        """Arm frame zero only after all three camera histories are advancing.
+
+        Episode-local histories are intentionally cleared at engage. A single coherent
+        cache snapshot does not prove that a publisher is still advancing: episodes 5/6
+        each committed one row and then immediately failed. Requiring four 30 Hz head
+        frames, three 15 Hz frames per wrist, and one selectable set gives roughly
+        130--200 ms of startup evidence while preserving the configured 10 Hz cadence
+        after the first commit. Unit drivers that predate this gate omit the state field
+        and are treated as already warm for backward-compatible focused tests.
+        """
+        if bool(getattr(self, "_record_camera_warmup_complete", True)):
+            return True
+        if not self._camera_alignment_enabled():
+            self._record_camera_warmup_complete = True
+            return True
+
+        alignment_lock = getattr(self, "_wrist_alignment_lock", None)
+        if alignment_lock is None:
+            head_history = list(self._head_alignment_buffer)
+            wrist_histories = {
+                arm: list(self._wrist_alignment_buffers[arm]) for arm in _WRIST_SENSOR_IDS
+            }
+        else:
+            with alignment_lock:
+                head_history = list(self._head_alignment_buffer)
+                wrist_histories = {
+                    arm: list(self._wrist_alignment_buffers[arm]) for arm in _WRIST_SENSOR_IDS
+                }
+        counts = {
+            "head": len(head_history),
+            **{f"{arm}_wrist": len(wrist_histories[arm]) for arm in _WRIST_SENSOR_IDS},
+        }
+        enough_history = counts["head"] >= _RECORD_STARTUP_MIN_HEAD_FRAMES and all(
+            counts[f"{arm}_wrist"] >= _RECORD_STARTUP_MIN_WRIST_FRAMES for arm in _WRIST_SENSOR_IDS
+        )
+        aligned_head, aligned_wrists, skew_ns = self._select_aligned_camera_samples()
+        if enough_history and aligned_head is not None and aligned_wrists is not None:
+            elapsed_ms = (
+                0.0
+                if self._record_camera_warmup_since is None
+                else (now - self._record_camera_warmup_since) * 1000.0
+            )
+            detail = ", ".join(f"{arm}={skew_ns[arm] / 1e6:+.1f}ms" for arm in _WRIST_SENSOR_IDS)
+            print(
+                "\n[wbc_vr_robot] --record: camera startup stable after "
+                f"{elapsed_ms:.0f} ms ({counts}, {detail}); arming frame zero."
+            )
+            self._record_camera_warmup_complete = True
+            self._record_camera_warmup_since = None
+            self._camera_alignment_stale_since = None
+            self._next_record_t = now
+            return True
+
+        if self._record_camera_warmup_since is None:
+            self._record_camera_warmup_since = now
+            print(
+                "\n[wbc_vr_robot] --record: validating advancing camera startup "
+                f"histories (need head>={_RECORD_STARTUP_MIN_HEAD_FRAMES}, each "
+                f"wrist>={_RECORD_STARTUP_MIN_WRIST_FRAMES}, plus |skew|<="
+                f"{self._record_max_camera_skew_ns / 1e6:g}ms); no frame committed yet."
+            )
+        elapsed = now - self._record_camera_warmup_since
+        timeout_s = float(
+            getattr(
+                self,
+                "_record_startup_timeout_s",
+                DEFAULT_RECORD_STARTUP_TIMEOUT,
+            )
+        )
+        if elapsed <= timeout_s:
+            self._next_record_t = now
+            return False
+
+        def newest(values, index: int) -> Optional[int]:
+            return None if not values else int(values[-1][index])
+
+        newest_stamps = {
+            "head": (None if not head_history else int(head_history[-1].left_capture_ns)),
+            **{f"{arm}_wrist": newest(wrist_histories[arm], 1) for arm in _WRIST_SENSOR_IDS},
+        }
+        skew_detail = {
+            arm: (None if arm not in skew_ns else skew_ns[arm] / 1e6) for arm in _WRIST_SENSOR_IDS
+        }
+        raise RuntimeError(
+            "[wbc_vr_robot] --record: camera startup never became stable within "
+            f"--record-startup-timeout {timeout_s:g}s; counts={counts}, "
+            f"newest_capture_ns={newest_stamps}, newest_head_skew_ms={skew_detail}. "
+            "No frame was committed. Verify all three publisher FPS/clock diagnostics "
+            "before re-engaging."
+        )
+
+    def _retry_or_abort_camera_alignment(
+        self,
+        now: float,
+        *,
+        head_ns: int,
+        skew_ns: dict[str, int],
+    ) -> None:
+        """Retry a row until both head-to-wrist skews satisfy the hard contract."""
+        limit_ms = int(self._record_max_camera_skew_ns) / 1e6
+
+        def arm_detail(arm: str) -> str:
+            if arm not in skew_ns:
+                return f"{arm}=NO_UNUSED_PAIR"
+            return f"{arm}={skew_ns[arm] / 1e6:+.1f}ms"
+
+        detail = ", ".join(arm_detail(arm) for arm in _WRIST_SENSOR_IDS)
+        if self._camera_alignment_stale_since is None:
+            self._camera_alignment_stale_since = now
+            print(
+                "\n[wbc_vr_robot] --record: no capture-aligned wrist set for head "
+                f"{head_ns} ({detail}; require |skew| <= {limit_ms:g}ms); retrying "
+                f"at the IK rate for up to {self._stale_grace * 1000.0:.0f} ms."
+            )
+        if now - self._camera_alignment_stale_since <= self._stale_grace:
+            self._next_record_t = now
+            return
+        alignment_lock = getattr(self, "_wrist_alignment_lock", None)
+        if alignment_lock is None:
+            buffered = {
+                arm: [int(sample[1]) for sample in self._wrist_alignment_buffers[arm]]
+                for arm in _WRIST_SENSOR_IDS
+            }
+        else:
+            with alignment_lock:
+                buffered = {
+                    arm: [int(sample[1]) for sample in self._wrist_alignment_buffers[arm]]
+                    for arm in _WRIST_SENSOR_IDS
+                }
+        raise RuntimeError(
+            "[wbc_vr_robot] --record: camera alignment failed for "
+            f"{(now - self._camera_alignment_stale_since) * 1000.0:.0f} ms "
+            f"(> --record-stale-grace {self._stale_grace * 1000.0:.0f} ms): "
+            f"head={head_ns}, {detail}, max_abs={limit_ms:g}ms, "
+            f"buffered_wrist_capture_ns={buffered}. Aborting so training never sees "
+            "a silently time-skewed multi-camera row."
+        )
+
+    def _camera_capture_ages_ns(
+        self,
+        wall_ns: int,
+        *,
+        head_ns: int,
+        wrist_ns: dict[str, int],
+    ) -> dict[str, int]:
+        """Capture-to-local-selection ages after camera-host clock correction."""
+        offsets = getattr(self, "_camera_clock_offsets_ns", {})
+        required = {"head", *(f"{arm}_wrist" for arm in wrist_ns)}
+        missing = sorted(required - set(offsets))
+        if missing:
+            raise RuntimeError(
+                f"[wbc_vr_robot] camera-age gate is missing clock offsets for {missing}"
+            )
+        ages = {"head": int(wall_ns - (int(head_ns) - int(offsets["head"])))}
+        ages.update(
+            {
+                f"{arm}_wrist": int(wall_ns - (int(stamp) - int(offsets[f"{arm}_wrist"])))
+                for arm, stamp in wrist_ns.items()
+            }
+        )
+        return ages
+
+    def _camera_age_diagnostics(self, ages_ns: dict[str, int]) -> dict:
+        """Separate an old selected set from a stalled coherent-camera history.
+
+        Snapshot only existing metadata; no SDK/network calls or image copies on
+        the servo thread. One delayed wrist can force selection of old head/left
+        frames even while those publishers and histories continue advancing.
+        """
+        wall_ns = time.time_ns()
+
+        def snapshot():
+            heads = getattr(self, "_head_alignment_buffer", ())
+            wrists = getattr(self, "_wrist_alignment_buffers", {})
+            return {
+                "head": int(heads[-1].left_capture_ns) if heads else None,
+                **{
+                    f"{arm}_wrist": int(values[-1][1]) if values else None
+                    for arm, values in wrists.items()
+                },
+            }
+
+        lock = getattr(self, "_wrist_alignment_lock", None)
+        if lock is None:
+            newest = snapshot()
+        else:
+            with lock:
+                newest = snapshot()
+        offsets = getattr(self, "_camera_clock_offsets_ns", {})
+        return {
+            "wall_ns": wall_ns,
+            "selected_age_ms": {key: value / 1e6 for key, value in ages_ns.items()},
+            "newest_coherent_capture_ns": newest,
+            "newest_coherent_age_ms": {
+                key: (wall_ns - stamp + int(offsets[key])) / 1e6
+                if stamp is not None and key in offsets
+                else None
+                for key, stamp in newest.items()
+            },
+        }
+
+    def _retry_or_abort_camera_age(self, now: float, *, ages_ns: dict[str, int]) -> None:
+        """Retry then abort when fresh frames are nevertheless transport-stale."""
+        limit_ns = int(self._record_max_camera_age_ns)
+        detail = ", ".join(f"{label}={age / 1e6:+.1f}ms" for label, age in ages_ns.items())
+        if self._camera_age_stale_since is None:
+            self._camera_age_stale_since = now
+            diagnostic = self._camera_age_diagnostics(ages_ns)
+            record_event(self, "camera_age_retry", diagnostic)
+            print(
+                "\n[wbc_vr_robot] --record: fresh camera capture is outside the "
+                f"age contract ({detail}; require -"
+                f"{_CAMERA_FUTURE_TOLERANCE_NS / 1e6:g} <= age <= "
+                f"{limit_ns / 1e6:g} ms); retrying at the IK rate for up to "
+                f"{self._stale_grace * 1000.0:.0f} ms. "
+                f"Newest coherent history ages (ms): {diagnostic['newest_coherent_age_ms']}"
+            )
+        if now - self._camera_age_stale_since <= self._stale_grace:
+            self._next_record_t = now
+            return
+        diagnostic = self._camera_age_diagnostics(ages_ns)
+        record_event(self, "camera_age_abort", diagnostic)
+        raise RuntimeError(
+            "[wbc_vr_robot] --record: camera delivery/cache age stayed outside "
+            f"--record-max-camera-age-ms={limit_ns / 1e6:g} for "
+            f"{(now - self._camera_age_stale_since) * 1000.0:.0f} ms: {detail}. "
+            f"Newest coherent history ages (ms): {diagnostic['newest_coherent_age_ms']}. "
+            "Aborting so image observations are not silently several frames older "
+            "than robot state/action. Reduce camera bandwidth/encode latency or raise "
+            "the limit only as an explicit dataset contract."
+        )
 
     def _retry_or_abort_stale(
         self,
@@ -1717,6 +3666,56 @@ class HardwareDriver:
             f"{history if history else ' <none recorded yet>'}"
         )
 
+    def _record_head_startup_ready(self, now: float) -> bool:
+        """Arm frame zero only once the measured head sits still on its command.
+
+        Startup-only, after the camera gate. The head is commanded every tick (nominal
+        in head_mode "fixed", the tracker output otherwise), so "settled" means every
+        joint within _RECORD_STARTUP_HEAD_TOL_RAD of the last sent command and moving
+        less than _RECORD_STARTUP_HEAD_STILL_RAD per tick. Gets its own
+        --record-startup-timeout budget, counted from its first evaluation (right after
+        the camera gate passes).
+        """
+        if bool(getattr(self, "_record_head_settled", True)):
+            return True
+        if self._record_head_since is None:
+            self._record_head_since = now
+        target = self._prev_cmd.get("head")
+        if target is None:
+            return False  # no head command has been sent yet this engage
+        meas = np.asarray(self._comp("head").get_joint_pos(), dtype=float)
+        if meas.shape != np.shape(target) or not np.all(np.isfinite(meas)):
+            raise RuntimeError(
+                f"[wbc_vr_robot] --record: head joint readback {meas!r} is not a finite "
+                f"{np.shape(target)} vector -- cannot arm frame zero."
+            )
+        prev = self._record_head_prev_meas
+        self._record_head_prev_meas = meas
+        err = float(np.max(np.abs(meas - np.asarray(target, dtype=float))))
+        step = float("inf") if prev is None else float(np.max(np.abs(meas - prev)))
+        if err <= _RECORD_STARTUP_HEAD_TOL_RAD and step <= _RECORD_STARTUP_HEAD_STILL_RAD:
+            print(
+                f"\n[wbc_vr_robot] --record: head settled on its command "
+                f"(|err| {err * 1e3:.1f} mrad, step {step * 1e3:.2f} mrad); arming frame zero."
+            )
+            self._record_head_settled = True
+            self._next_record_t = now
+            return True
+        if now - self._record_head_since > self._record_startup_timeout_s:
+            raise RuntimeError(
+                "[wbc_vr_robot] --record: head never settled on its command within "
+                f"--record-startup-timeout {self._record_startup_timeout_s:g}s: measured "
+                f"{np.round(meas, 3).tolist()} vs commanded "
+                f"{np.round(np.asarray(target, dtype=float), 3).tolist()} (|err| "
+                f"{err * 1e3:.0f} mrad > {_RECORD_STARTUP_HEAD_TOL_RAD * 1e3:.0f}, step "
+                f"{step * 1e3:.1f} mrad). No frame was committed."
+            )
+        return False
+
+    def _recording_extra_action(self) -> dict:
+        """Subclass-specific raw action fields merged into each recorded frame."""
+        return {}
+
     def record_tick(
         self,
         result,
@@ -1725,23 +3724,32 @@ class HardwareDriver:
         left_target: np.ndarray,
         right_target: np.ndarray,
         head_target: np.ndarray,
+        source_timestamp_ns: int,
+        source_receive_wall_ns: int,
     ) -> None:
-        """Append one episode frame while engaged (no-op unless ``--record``).
+        """Append a due recording row after actuation; skip while held or inactive.
 
-        Throttled to ``--record-rate``; skips while ``hold`` (e-stop / failed solve /
-        safety hold / stale source) so only live teleop is recorded. Must run AFTER
-        :meth:`actuate` so ``self._prev_base_cmd`` holds this tick's chassis command and
-        ``self._dbg['sent_joints']`` holds this tick's post-clamp joint commands.
-
-        ``left_target`` / ``right_target`` / ``head_target`` are the WORLD-frame
-        (engage-origin) 4x4 targets given to ``ik.solve()`` this tick -- the head
-        target post LPF/planar-deadband -- recorded VERBATIM as ``action/eef/*`` and
-        ``action/head``. Offline consumers must never recompute or re-anchor them.
+        Store the exact IK targets and post-clamp/post-filter joint commands without
+        re-anchoring them. Camera selection must satisfy freshness and alignment gates.
+        Producer and subscriber timestamps retain the selected command's causal timing.
         """
         if self._episode is None or not self._episode.recording or hold:
             return
+        # Sample the already-decoded camera caches on EVERY 100 Hz control tick, not
+        # only on due 10 Hz rows. This preserves the frames needed to choose the
+        # freshest coherent head/wrist set without changing bandwidth or blocking
+        # actuation.
+        self._poll_camera_alignment_buffers()
+        # At a fresh engage, prove that every publisher is advancing before committing
+        # frame zero. This startup-only gate prevents a one-row file from being created
+        # from stale subscriber caches; normal 10 Hz throttling and the stricter
+        # mid-episode retry/abort contracts begin immediately after it passes.
+        if not self._record_camera_startup_ready(now):
+            return
+        if not self._record_head_startup_ready(now):
+            return
         # Throttle to --record-rate, locked to ideal timestamps (re-anchor if we fall
-        # >1 period behind) so the saved HDF5 has a consistent cadence.
+        # >1 period behind) so the saved HDF5 has a consistent FPS, like vr_reader.
         if self._next_record_t == 0.0:
             self._next_record_t = now
         if now < self._next_record_t:
@@ -1758,6 +3766,25 @@ class HardwareDriver:
                 "[wbc_vr_robot] record_tick requires post-clamp _dbg['sent_joints'] "
                 "(actuate() must run before record_tick on a non-hold tick)"
             )
+        source_timestamp_ns = int(source_timestamp_ns)
+        source_receive_wall_ns = int(source_receive_wall_ns)
+        dispatch_start_ns = int(getattr(self, "_last_action_dispatch_start_wall_ns", -1))
+        dispatch_end_ns = int(getattr(self, "_last_action_dispatch_end_wall_ns", -1))
+        if source_timestamp_ns <= 0 or source_receive_wall_ns <= 0:
+            raise RuntimeError(
+                "[wbc_vr_robot] record_tick requires positive source command publish "
+                "and receive timestamps"
+            )
+        if dispatch_start_ns <= 0 or dispatch_end_ns < dispatch_start_ns:
+            raise RuntimeError(
+                "[wbc_vr_robot] record_tick requires a completed actuation timestamp "
+                "bracket from actuate()"
+            )
+        if source_receive_wall_ns > dispatch_start_ns:
+            raise RuntimeError(
+                "[wbc_vr_robot] source command receive time is later than actuation "
+                f"start ({source_receive_wall_ns} > {dispatch_start_ns})"
+            )
         left_target = np.asarray(left_target, dtype=np.float64)
         right_target = np.asarray(right_target, dtype=np.float64)
         head_target = np.asarray(head_target, dtype=np.float64)
@@ -1767,7 +3794,7 @@ class HardwareDriver:
             or head_target.shape != (4, 4)
         ):
             raise RuntimeError(
-                "[wbc_vr_robot] record_tick expected 4x4 Cartesian targets, got "
+                "[wbc_vr_robot] record_tick expected 4x4 policy targets, got "
                 f"left={left_target.shape}, right={right_target.shape}, "
                 f"head={head_target.shape}"
             )
@@ -1776,11 +3803,11 @@ class HardwareDriver:
             or not np.all(np.isfinite(right_target))
             or not np.all(np.isfinite(head_target))
         ):
-            raise RuntimeError("[wbc_vr_robot] record_tick received a non-finite target")
+            raise RuntimeError("[wbc_vr_robot] record_tick received a non-finite policy target")
         if self._odom is None:
             raise RuntimeError(
                 "[wbc_vr_robot] record_tick requires odometry (--enable base): "
-                "obs/base/pose anchors the world-frame Cartesian targets"
+                "obs/base/pose anchors the world-frame policy action targets"
             )
         base_pose_cmd = np.asarray(result.base_pose, dtype=np.float32)
         if base_pose_cmd.shape != (3,) or not np.all(np.isfinite(base_pose_cmd)):
@@ -1808,14 +3835,66 @@ class HardwareDriver:
                 )
             return arr
 
-        imgs = self._grab_head_images()
-        wrist = {arm: self._grab_wrist_image(arm) for arm in _WRIST_SENSOR_IDS}
+        want_wrist_right = bool(getattr(getattr(self, "args", None), "wrist_right_rgb", False))
+        aligned_head_sample: Optional[_HeadAlignmentSample] = None
+        aligned_samples: Optional[dict[str, tuple]] = None
+        alignment_skew_ns: dict[str, int] = {}
+        if self._camera_alignment_enabled():
+            (
+                aligned_head_sample,
+                aligned_samples,
+                alignment_skew_ns,
+            ) = self._select_aligned_camera_samples()
+            imgs = None if aligned_head_sample is None else aligned_head_sample.images_tuple()
+            wrist = (
+                {arm: None for arm in _WRIST_SENSOR_IDS}
+                if aligned_samples is None
+                else {
+                    arm: (sample[0], sample[1], sample[3], sample[4])
+                    for arm, sample in aligned_samples.items()
+                }
+            )
+        else:
+            imgs = self._grab_head_images()
+            if want_wrist_right:
+                wrist = {arm: self._grab_wrist_stereo(arm) for arm in _WRIST_SENSOR_IDS}
+            else:
+                wrist = {
+                    arm: (
+                        None
+                        if (mono := self._grab_wrist_image(arm)) is None
+                        else (mono[0], mono[1], None, None)
+                    )
+                    for arm in _WRIST_SENSOR_IDS
+                }
         # Before the first recorded frame the cameras may still be warming up (the leader can
         # reach teleop before a publisher is fully up): tolerate a missing stream and skip
-        # this tick.
+        # this tick, matching vr_reader.
         recording_started = self._last_rec_head_ns >= 0
-        if (imgs is None or any(w is None for w in wrist.values())) and not recording_started:
+        if imgs is None and not recording_started:
             return  # camera still warming up -- skip rather than write inconsistent keys
+        if self._camera_alignment_enabled() and imgs is not None and aligned_samples is None:
+            self._retry_or_abort_camera_alignment(
+                now,
+                head_ns=int(imgs[2]),
+                skew_ns=alignment_skew_ns,
+            )
+            return
+        if any(w is None for w in wrist.values()) and not recording_started:
+            return  # compatibility mode: wrist camera still warming up
+        if (
+            getattr(self, "_camera_alignment_stale_since", None) is not None
+            and aligned_samples is not None
+        ):
+            detail = ", ".join(
+                f"{arm}={alignment_skew_ns[arm] / 1e6:+.1f}ms" for arm in _WRIST_SENSOR_IDS
+            )
+            print(
+                "\n[wbc_vr_robot] --record: capture-aligned wrist frames resumed "
+                f"after {(now - self._camera_alignment_stale_since) * 1000.0:.0f} ms "
+                f"({detail})."
+            )
+            self._camera_alignment_stale_since = None
         # Freshness guard: ~15 fps camera vs ~10 fps record means every recorded frame must
         # carry a strictly newer publisher timestamp than the last recorded one. A non-newer
         # (or missing) frame is the delivery path repeating the cached latest -- the
@@ -1846,6 +3925,35 @@ class HardwareDriver:
                 f"{head_ns - self._last_rec_head_ns} ns, {deltas})."
             )
             self._stale_since = None
+
+        age_limit_ns = int(getattr(self, "_record_max_camera_age_ns", 0))
+        if age_limit_ns > 0:
+            capture_ages_ns = self._camera_capture_ages_ns(
+                time.time_ns(),
+                head_ns=int(head_ns),
+                wrist_ns={arm: int(ns) for arm, ns in wrist_ns.items()},
+            )
+            bad_age = any(
+                age < -_CAMERA_FUTURE_TOLERANCE_NS or age > age_limit_ns
+                for age in capture_ages_ns.values()
+            )
+            if bad_age:
+                self._retry_or_abort_camera_age(now, ages_ns=capture_ages_ns)
+                return
+            if getattr(self, "_camera_age_stale_since", None) is not None:
+                detail = ", ".join(
+                    f"{label}={age / 1e6:.1f}ms" for label, age in capture_ages_ns.items()
+                )
+                print(f"\n[wbc_vr_robot] --record: camera capture age recovered ({detail}).")
+                record_event(
+                    self,
+                    "camera_age_recovered",
+                    {
+                        "retry_duration_s": now - self._camera_age_stale_since,
+                        "selected_age_ns": capture_ages_ns,
+                    },
+                )
+                self._camera_age_stale_since = None
         (
             head_left_rgb,
             head_depth_u16,
@@ -1857,8 +3965,9 @@ class HardwareDriver:
 
         # The independently delivered right-eye message can lag the left by one frame.
         # Retry for at most one record period so FoundationStereo receives same-capture
-        # pairs without blocking the IK loop. If a publisher never stamps the eyes alike,
-        # eventually disarm this retry rather than silently reducing the whole take's fps.
+        # pairs without blocking the IK loop. A persistent mismatch aborts the take:
+        # different-capture eyes cannot be repaired offline and must never be written as
+        # a nominal stereo pair.
         if head_right_ns is not None and head_right_ns != head_ns:
             if self._right_pair_retry:
                 if self._right_unpaired_since is None:
@@ -1868,17 +3977,72 @@ class HardwareDriver:
                     return
             self._rec_right_unpaired += 1
             self._right_unpaired_streak += 1
-            if self._right_pair_retry and self._right_unpaired_streak >= _RIGHT_PAIR_GIVE_UP:
-                self._right_pair_retry = False
-                print(
-                    "\n[wbc_vr_robot] --record: the head right eye did not pair with "
-                    f"the left on {self._right_unpaired_streak} consecutive frames -- "
-                    "disarming the pairing retry for this episode. Frames are still "
-                    "recorded, but offline stereo will skip the unpaired ones."
-                )
+            raise RuntimeError(
+                "[wbc_vr_robot] --record: head stereo eyes stayed on different "
+                f"captures for {(now - self._right_unpaired_since) * 1000.0:.1f} ms: "
+                f"left={head_ns}, right={head_right_ns}. Aborting because "
+                "FoundationStereo requires same-capture rectified eyes."
+            )
         else:
             self._right_unpaired_streak = 0
         self._right_unpaired_since = None
+
+        # Apply the same same-capture contract independently to each wrist stereo
+        # pair. The two wrist cameras are not synchronized with each other (or the
+        # head); only the left/right eyes within a physical ZED must share a stamp.
+        if want_wrist_right:
+            for arm, sample in wrist.items():
+                assert sample is not None
+                right_ns = sample[3]
+                assert right_ns is not None
+                if right_ns != wrist_ns[arm]:
+                    if self._wrist_right_pair_retry[arm]:
+                        if self._wrist_right_unpaired_since[arm] is None:
+                            self._wrist_right_unpaired_since[arm] = now
+                        if now - self._wrist_right_unpaired_since[arm] <= min(
+                            self._stale_grace, self._record_period
+                        ):
+                            self._next_record_t = now
+                            return
+                    self._rec_wrist_right_unpaired[arm] += 1
+                    self._wrist_right_unpaired_streak[arm] += 1
+                    raise RuntimeError(
+                        f"[wbc_vr_robot] --record: {arm} wrist stereo eyes stayed on "
+                        "different captures for "
+                        f"{(now - self._wrist_right_unpaired_since[arm]) * 1000.0:.1f} "
+                        f"ms: left={wrist_ns[arm]}, right={right_ns}. Aborting because "
+                        "FoundationStereo requires same-capture rectified eyes."
+                    )
+                else:
+                    self._wrist_right_unpaired_streak[arm] = 0
+                self._wrist_right_unpaired_since[arm] = None
+
+        # Drain achieved-gripper callbacks at the record cadence. A frame is eligible
+        # only while BOTH arms have post-engage FC03 samples inside the bounded age
+        # window. A single missed reply is an explicit zero-order hold, not a dropped
+        # image/action row; an unbounded cache still fails closed.
+        gripper_statuses: Optional[dict[str, dict]] = None
+        if self._grip_monitors:
+            self._poll_gripper_status_step(allow_request=False)
+            gripper_statuses = self._fresh_gripper_statuses()
+            if gripper_statuses is None:
+                if self._grip_status_stale_since is None:
+                    self._grip_status_stale_since = now
+                grace_s = max(0.5, self._stale_grace)
+                if now - self._grip_status_stale_since <= grace_s:
+                    # Do not advance the last-recorded camera stamps: the same candidate
+                    # images remain valid while the missing FC03 reply catches up.
+                    self._next_record_t = now
+                    return
+                stats = {side: monitor.stats() for side, monitor in self._grip_monitors.items()}
+                raise RuntimeError(
+                    "[wbc_vr_robot] --record: no valid bounded-age gripper status from "
+                    f"both arms within {grace_s:.3f}s (selection maximum "
+                    f"{(_GRIPPER_STATUS_MAX_AGE_PERIODS - _GRIPPER_STATUS_COMMIT_MARGIN_PERIODS) * self._record_period * 1000.0:.0f} "
+                    "ms, reserving commit margin inside the exact offline limit). "
+                    f"monitor_stats={stats}"
+                )
+            self._grip_status_stale_since = None
 
         # Arrival-age history for the stale-abort diagnostic: local wall clock minus the
         # publisher capture stamp (spans the camera-host->workstation clock offset, so
@@ -1896,13 +4060,9 @@ class HardwareDriver:
         # Every value is non-None past the freshness gate above.
         self._last_rec_wrist_ns = {arm: int(ns) for arm, ns in wrist_ns.items()}
 
-        # Refresh achieved-gripper obs (FC03) at the record cadence (drains queued replies
-        # into self._last_obs_grip_{left,right}, then re-requests).
-        if self._grip_monitors:
-            self._poll_gripper_status_step()
-
         # Measured joints -> obs/joint (also the offline FK source for world_t_cam).
         # Validate shapes aggressively -- a bad readback must abort, never be recorded as-is.
+        state_read_start_ns = time.time_ns()
         obs: dict[str, np.ndarray] = {}
         for grp, names in self._joint_names.items():
             meas = np.asarray(self._comp(grp).get_joint_pos(), dtype=np.float32)
@@ -1912,6 +4072,20 @@ class HardwareDriver:
                     f"({len(names)},) or non-finite -- cannot record."
                 )
             obs[grp] = meas
+
+        # One odometry snapshot supplies BOTH pose and twist below. Reading the two
+        # properties separately can straddle a 200 Hz odometry update and create a
+        # physically impossible state row. ARKit is snapshotted inside the same read
+        # bracket, though it remains an independent sensor sample.
+        odom_state = self._odom.snapshot()
+        arkit_state = self._arkit.snapshot() if self._arkit is not None else None
+        state_read_end_ns = time.time_ns()
+        if state_read_start_ns < dispatch_end_ns or state_read_end_ns < state_read_start_ns:
+            raise RuntimeError(
+                "[wbc_vr_robot] invalid actuation/state timing order: "
+                f"dispatch_end={dispatch_end_ns}, state_start={state_read_start_ns}, "
+                f"state_end={state_read_end_ns}"
+            )
 
         base_cmd = self._prev_base_cmd  # shaped twist actually sent to the chassis
         # obs/joint base = the MEASURED wheel-odometry body twist (achieved-velocity
@@ -1925,7 +4099,11 @@ class HardwareDriver:
             "torso": obs["torso"],
         }
         if self._odom is not None:
-            meas_twist = self._odom.twist
+            meas_twist = np.asarray(odom_state["twist"], dtype=np.float64)
+            if meas_twist.shape != (3,) or not np.all(np.isfinite(meas_twist)):
+                raise RuntimeError(
+                    f"[wbc_vr_robot] odometry twist {meas_twist!r} is not finite (3,)"
+                )
             obs_joint["chassis_vx"] = np.float32(meas_twist[0])
             obs_joint["chassis_vy"] = np.float32(meas_twist[1])
             obs_joint["chassis_wz"] = np.float32(meas_twist[2])
@@ -1936,8 +4114,8 @@ class HardwareDriver:
             "right_wrist_rgb": wrist["right"][0],
             # Publisher capture stamps (camera-publisher-host clock) of THIS tick's frames plus the
             # local wall clock right after all grabs -- the raw material for offline
-            # camera-latency audits/correction, with meta/camera_ntp. The freshness gate
-            # above requires head RGB and
+            # camera-latency audits/correction (scripts/audit_episode_latency.py, with
+            # meta/camera_ntp when available). The freshness gate above requires head RGB and
             # both wrist stamps to advance; depth's stamp is recorded separately for RGBD audits.
             "head_frame_ns": np.int64(head_ns),
             "left_wrist_frame_ns": np.int64(wrist_ns["left"]),
@@ -1954,60 +4132,181 @@ class HardwareDriver:
             assert head_right_ns is not None
             images["head_right_rgb"] = head_right_rgb
             images["head_right_frame_ns"] = np.int64(head_right_ns)
+        if want_wrist_right:
+            for arm, sample in wrist.items():
+                assert sample is not None and sample[2] is not None and sample[3] is not None
+                images[f"{arm}_wrist_right_rgb"] = sample[2]
+                images[f"{arm}_wrist_right_frame_ns"] = np.int64(sample[3])
+        receive_keys = {
+            "head_receive_ns": "head_camera left_rgb",
+            **{
+                f"{arm}_wrist_receive_ns": f"{sensor_id} left_rgb"
+                for arm, sensor_id in _WRIST_SENSOR_IDS.items()
+            },
+        }
+        if head_depth_u16 is not None:
+            receive_keys["head_depth_receive_ns"] = "head_camera depth"
+        if head_right_rgb is not None:
+            receive_keys["head_right_receive_ns"] = "head_camera right_rgb"
+        if want_wrist_right:
+            receive_keys.update(
+                {
+                    f"{arm}_wrist_right_receive_ns": f"{sensor_id} right_rgb"
+                    for arm, sensor_id in _WRIST_SENSOR_IDS.items()
+                }
+            )
+        receive_cache = getattr(self, "_last_camera_receive_ns", {})
+        receive_values = {
+            output_key: receive_cache.get(cache_key)
+            for output_key, cache_key in receive_keys.items()
+        }
+        if aligned_head_sample is not None:
+            # As with wrists below, the global subscriber cache may already point at a
+            # newer head frame than the buffered anchor selected for this row.
+            receive_values["head_receive_ns"] = int(aligned_head_sample.left_receive_ns)
+            if head_depth_u16 is not None:
+                assert aligned_head_sample.depth_receive_ns is not None
+                receive_values["head_depth_receive_ns"] = int(aligned_head_sample.depth_receive_ns)
+            if head_right_rgb is not None:
+                assert aligned_head_sample.right_receive_ns is not None
+                receive_values["head_right_receive_ns"] = int(aligned_head_sample.right_receive_ns)
+        if aligned_samples is not None:
+            # The global subscriber cache now points at the newest polled wrist frame,
+            # which may be newer than the history sample selected for this row. Preserve
+            # the selected frame's own receive stamp so delivery/cache-age audits remain
+            # exact.
+            for arm, sample in aligned_samples.items():
+                receive_values[f"{arm}_wrist_receive_ns"] = int(sample[2])
+                if want_wrist_right:
+                    assert sample[5] is not None
+                    receive_values[f"{arm}_wrist_right_receive_ns"] = int(sample[5])
+        if any(value is not None for value in receive_values.values()):
+            missing = sorted(key for key, value in receive_values.items() if value is None)
+            if missing:
+                raise RuntimeError(
+                    "[wbc_vr_robot] partial camera receive timestamps after a complete "
+                    f"image grab; missing {missing}"
+                )
+            for key, value in receive_values.items():
+                assert value is not None
+                if value > wall_ns:
+                    raise RuntimeError(
+                        f"[wbc_vr_robot] obs/images/{key}={value} is later than "
+                        f"grab_wall_ns={wall_ns}"
+                    )
+                images[key] = np.int64(value)
         obs_out: dict = {
             "joint": obs_joint,
             # Gripper obs = the Robotiq FC03 achieved position (gPO/255 in [0,1]), refreshed
-            # above at the record cadence; NaN until the monitor first replies.
+            # above at the record cadence; NaN until the monitor first replies (matches
+            # vr_reader's obs/gripper).
             "gripper": {
                 "left": np.float32(self._last_obs_grip_left),
                 "right": np.float32(self._last_obs_grip_right),
             },
             "images": images,
         }
+        if gripper_statuses is not None:
+            # Full status provenance is tiny compared with RGB and turns a bad gPO trace
+            # into a diagnosable failure (command echo, faults, object state, request /
+            # response identity and wall-clock timing) instead of an unexplained scalar.
+            obs_out["gripper_status"] = {
+                side: self._recordable_gripper_status(status)
+                for side, status in gripper_statuses.items()
+            }
         if self._odom is not None:
-            # Measured base pose (x, y, yaw) in the engage-origin world frame (the odom is
-            # zeroed on the engage edge), the pose counterpart to the obs/joint/chassis_*
-            # body twist. Lets the cloud/camera/robot be placed in world frame offline:
-            # world_t_cam = world_t_base(pose) . FK_cam(obs/joint).
-            # Only present with --enable base (no odom thread otherwise); the enable mask is
-            # fixed for the whole run, so every frame in a take agrees on keys.
-            obs_out["base"] = {"pose": np.asarray(self._odom.pose, dtype=np.float32)}
+            # Canonical measured pose in the SAME engage-origin frame/source that closes
+            # the base PD loop: odometry normally, ARKit under --arkit-base control. This
+            # keeps policy state and world-frame action targets physically consistent.
+            # Wheel odometry remains explicit as pose_odom because it still supplies the
+            # achieved chassis twist and is needed to audit drift.
+            odom_pose = np.asarray(odom_state["pose"], dtype=np.float32)
+            if odom_pose.shape != (3,) or not np.all(np.isfinite(odom_pose)):
+                raise RuntimeError(f"[wbc_vr_robot] odometry pose {odom_pose!r} is not finite (3,)")
+            canonical_pose = odom_pose
+            if self._arkit_drives_base():
+                assert arkit_state is not None
+                canonical_pose = np.asarray(arkit_state["pose"], dtype=np.float32)
+                if canonical_pose.shape != (3,) or not np.all(np.isfinite(canonical_pose)):
+                    raise RuntimeError(
+                        f"[wbc_vr_robot] ARKit control pose {canonical_pose!r} is not finite (3,)"
+                    )
+            obs_out["base"] = {
+                "pose": canonical_pose,
+                "pose_odom": odom_pose,
+            }
+            if self._arkit is not None:
+                # Explicit drift-free source. Under control this equals canonical ``pose``;
+                # under record-only mode canonical remains the odometry control source.
+                # ``_world`` is continuous across re-engages in one ARKit session.
+                assert arkit_state is not None
+                obs_out["base"]["pose_arkit"] = np.asarray(arkit_state["pose"], dtype=np.float32)
+                obs_out["base"]["pose_arkit_world"] = np.asarray(
+                    arkit_state["world_pose"], dtype=np.float32
+                )
+        commit_wall_ns = time.time_ns()
+        if gripper_statuses is not None:
+            self._validate_gripper_status_commit_age(
+                gripper_statuses,
+                commit_wall_ns,
+            )
         frame = {
-            "timestamp_ns": np.int64(time.time_ns()),
+            # Historical episode timestamp: now explicitly the final record-commit
+            # wall time. The causal stage timestamps live in /timing below.
+            "timestamp_ns": np.int64(commit_wall_ns),
+            "timing": {
+                "source_timestamp_ns": np.int64(source_timestamp_ns),
+                "source_receive_wall_ns": np.int64(source_receive_wall_ns),
+                "action_dispatch_start_wall_ns": np.int64(dispatch_start_ns),
+                "action_dispatch_end_wall_ns": np.int64(dispatch_end_ns),
+                "state_read_start_wall_ns": np.int64(state_read_start_ns),
+                "state_read_end_wall_ns": np.int64(state_read_end_ns),
+            },
             "action": {
                 "joint": {
-                    # Every group records the post-clamp command actually sent to hardware
+                    # torso added vs vr_reader: the WBC commands the torso here. Every
+                    # group records the POST-CLAMP command actually sent to hardware
                     # (actuate's _dbg['sent_joints']), not the raw WBC result.
                     "torso": action_joint("torso", (3,)),
                     "left_arm": action_joint("left_arm", (7,)),
                     "right_arm": action_joint("right_arm", (7,)),
                     "head": action_joint("head", (3,)),
-                    # Base action = the shaped twist sent to the chassis.
+                    # Base action = the shaped twist sent to the chassis (the WBC drives
+                    # the base; the leader thumbstick chassis_* is unused here).
                     "chassis_vx": np.float32(base_cmd[0]),
                     "chassis_vy": np.float32(base_cmd[1]),
                     "chassis_wz": np.float32(base_cmd[2]),
                 },
                 # Gripper action = the clipped leader trigger commanded this tick (stashed
-                # by actuate).
+                # by actuate), matching vr_reader's action/gripper.
                 "gripper": {
                     "left": np.float32(self._last_gripper_cmd_left),
                     "right": np.float32(self._last_gripper_cmd_right),
                 },
-                # Exact world-frame targets given to ik.solve()
+                # 10 Hz policy action: the EXACT world-frame targets given to ik.solve()
                 # this tick (head post LPF/planar-deadband), stored verbatim -- offline
-                # consumers must never recompute or re-anchor them.
+                # Offline conversion must preserve the recorded target frame and anchor.
                 "eef": {
                     "left": left_target.astype(np.float32),
                     "right": right_target.astype(np.float32),
                 },
                 "head": head_target.astype(np.float32),
                 # Solver's commanded base pose in the same engage-origin world as
-                # obs/base/pose. This diagnostic field lets offline
+                # obs/base/pose. NOT a policy field: free to record, and lets offline
                 # analysis derive base-frame variants and IK-vs-odom tracking error.
                 "base": {"pose": base_pose_cmd},
             },
             "obs": obs_out,
         }
+        extra_action = self._recording_extra_action()
+        if not isinstance(extra_action, dict):
+            raise TypeError("_recording_extra_action() must return a dict")
+        overlap = set(frame["action"]).intersection(extra_action)
+        if overlap:
+            raise RuntimeError(
+                f"extra recording action collides with canonical keys {sorted(overlap)}"
+            )
+        frame["action"].update(extra_action)
         self._episode.record(frame)
 
     def close(self) -> None:
@@ -2019,10 +4318,23 @@ class HardwareDriver:
         self.stop_all_motion()
         if self._odom is not None:
             self._odom.stop()
+        if self._arkit is not None:
+            self._arkit.close()
         # Flush the episode BEFORE shutting the robot down. EpisodeRecorder saves in a
         # daemon thread, so block here until it finishes -- otherwise process exit could
         # kill the save mid-write.
         self.stop_recording_episode()
+        motion_recorder = getattr(self, "_camera_motion_recorder", None)
+        if motion_recorder is not None:
+            # Normally already stopped; quarantine any orphan after an abort.
+            motion_recorder.stop(aborted=True)
+            motion_recorder.close()
+        native = getattr(self, "_native_state_recorder", None)
+        if native is not None:
+            try:
+                native.close()
+            except Exception as exc:
+                print(f"Native sidecar incomplete: {exc}", flush=True)
         # Best-effort teardown of the FC03 gripper-status subscribers.
         for monitor in getattr(self, "_grip_monitors", {}).values():
             try:
@@ -2041,7 +4353,8 @@ def _build_ik(*, lock_torso_in_ik: Optional[bool] = None) -> tuple[VegaWholeBody
     if lock_torso_in_ik is not None:
         cfg.lock_torso_in_ik = bool(lock_torso_in_ik)
     # head_mode "ik" pins cfg.head_ik_pinned_joints (wbik.yaml; default head_j1/head_j2)
-    # out of the QP; VegaWholeBodyIK builds the pin from this same config.
+    # out of the QP -- VegaWholeBodyIK builds the pin from the config, so this real-robot
+    # follower and the sim follower (wbc_vr_record.py) fix the SAME head DOFs.
     ik = VegaWholeBodyIK(cfg)
     if cfg.head_mode == "ik":
         print(
@@ -2086,10 +4399,20 @@ def run_loop(
     )
 
     left_cmd, right_cmd, head_cmd = left0.copy(), right0.copy(), head0.copy()
+    # Stall-immune clock for the target pipeline (interpolator + engage glide). A dry run
+    # advances an injected virtual clock as fast as the CPU allows, so the clamp applies
+    # only to the realtime hardware loop; elsewhere this tracks ``clock()`` exactly.
+    max_target_advance = MAX_TARGET_CLOCK_ADVANCE_TICKS * dt if realtime else float("inf")
+    target_now = 0.0
+    prev_now: Optional[float] = None
     last_cmd_ns = -1
+    last_cmd_receive_wall_ns = -1
     last_home_request_ns = -1
+    engage_glide_until = -float("inf")
     last_cmd_wall: Optional[float] = None
     prev_estop = True
+    sweep_enabled = bool(getattr(args, "scenediff_sweep", False)) and not replay
+    sweep = None
     source.start()
     status_pub = None if replay else _create_status_publisher(source)
     status_period = 1.0 / DEFAULT_STATUS_PUBLISH_RATE
@@ -2102,40 +4425,154 @@ def run_loop(
         f"enable={[k for k, v in enable.items() if v]} grippers=on"
     )
 
-    def resync_to_nominal(reason: str) -> None:
-        """Re-anchor the solver and the target streams on the nominal posture.
+    def resync_controller(reason: str, joint_seed: Optional[dict] = None) -> None:
+        """Re-anchor the solver and target streams on nominal or measured joints.
 
-        The engage transition and a home request both leave the HARDWARE at nominal, so
-        the model, the interpolator/filters and the odometry origin have to be put back
-        there in lock-step. Without this after a home request the solver kept tracking the
-        pre-home targets from its stale configuration, so the leader HUD kept bannering
-        that posture's self-collision warning while the robot stood at nominal.
+        Home leaves hardware at nominal. SceneDiff alignment instead starts directly
+        from its measured parked pose, avoiding a redundant return move and a command
+        jump. In both cases the model, filters and odometry origin move in lock-step.
         """
-        nonlocal left_cmd, right_cmd, head_cmd, last_cmd_ns
-        ik.reset()
-        interp.reset(left0, right0, head0)
-        head_lpf.reset(head0)
-        head_planar_deadband.reset(head0)
-        left_cmd, right_cmd, head_cmd = left0.copy(), right0.copy(), head0.copy()
+        nonlocal left_cmd, right_cmd, head_cmd, last_cmd_ns, last_cmd_receive_wall_ns
+        if joint_seed is None:
+            ik.reset()
+        else:
+            q = ik.nominal_q()
+            for grp, names in driver._joint_names.items():
+                values = np.asarray(joint_seed[grp], dtype=float)
+                if values.shape != (len(names),) or not np.all(np.isfinite(values)):
+                    raise RuntimeError(f"invalid measured {grp} alignment seed")
+                for name, value in zip(names, values, strict=True):
+                    q[ik._idx_q[name]] = float(value)
+            ik.reset(q)
+        left_anchor = _to_mat(ik.frame_pose(LEFT_EE_FRAME))
+        right_anchor = _to_mat(ik.frame_pose(RIGHT_EE_FRAME))
+        head_anchor = _to_mat(ik.frame_pose(HEAD_FRAME))
+        interp.reset(left_anchor, right_anchor, head_anchor)
+        head_lpf.reset(head_anchor)
+        head_planar_deadband.reset(head_anchor)
+        left_cmd, right_cmd, head_cmd = (
+            left_anchor.copy(),
+            right_anchor.copy(),
+            head_anchor.copy(),
+        )
         last_cmd_ns = -1
-        driver.engage_reset(ik, left0, right0, head0)
-        print(f"\n[wbc_vr_robot] {reason}: reset IK to nominal.")
+        last_cmd_receive_wall_ns = -1
+        driver.engage_reset(ik, left_anchor, right_anchor, head_anchor)
+        anchor = "measured parked pose" if joint_seed is not None else "nominal"
+        print(f"\n[wbc_vr_robot] {reason}: reset IK to {anchor}.")
 
     while True:
         now = clock()
+        # Advance the target clock by the elapsed wall time, clamped. Anything withheld is
+        # time the loop spent blocked rather than actuating, so the leader targets that
+        # accumulated meanwhile are glided in over the stall's own length instead of being
+        # compressed into one command period. Cap it at the engage glide: that is already
+        # the slowest re-approach this loop ever commands.
+        elapsed = dt if prev_now is None else now - prev_now
+        prev_now = now
+        advance = min(elapsed, max_target_advance)
+        target_now += advance
+        stall = elapsed - advance
+        if stall > 0.0:
+            engage_glide_until = max(engage_glide_until, target_now + min(stall, ENGAGE_GLIDE_S))
         t = now - t0
         if replay and source.done:
             break
-        vr = source.latest
+        latest_sample = getattr(source, "latest_sample", None)
+        if latest_sample is not None:
+            vr, vr_receive_wall_ns = latest_sample
+        else:
+            vr = source.latest
+            # Replay and test sources have no transport callback. Stamp when this loop
+            # observes the released command, preserving the same causal schema.
+            vr_receive_wall_ns = time.time_ns()
+        # A specialized driver may consume fields from the same command object as the
+        # Cartesian target path. Latch it once here so a subscriber callback cannot advance
+        # ``source.latest`` between the arm/head solve and base dispatch/recording.
+        if hasattr(driver, "latch_source_sample"):
+            driver.latch_source_sample(vr)
         if vr is not None and vr.exit_requested:
-            # Left X is an immediate stop request, not a recorded frame: stop motion
+            # Left X is an immediate stop request, not a training frame: stop motion
             # before recorder shutdown, and do not append the exit/stop state.
             driver.stop_all_motion()
+            if sweep is not None:
+                sweep.close()
             print("\n[wbc_vr_robot] leader requested exit; motion stopped.")
             break
 
+        home_required = bool(getattr(driver, "home_required", lambda: False)())
+        if home_required and sweep is not None:
+            sweep.close()
+            sweep = None
+            driver._scenediff_session = None
+        if sweep_enabled and not home_required:
+            from omniteleop.wbc_scenediff_collection import CollectionSweep
+
+            request_id = str(getattr(vr, "scenediff_request_id", ""))
+            stage = str(getattr(vr, "calib_stage", "static"))
+            fresh = (
+                vr is not None
+                and 0 <= (time.time_ns() - vr_receive_wall_ns) / 1e9 < args.source_timeout
+            )
+            # X/home clear the token; stale streams and Y cannot leave motion latched.
+            if sweep is not None and (not fresh or request_id != sweep.request_id):
+                sweep.close()
+                sweep = None
+                driver._scenediff_session = None
+                if not fresh:
+                    raise RuntimeError("controller stream lost during SceneDiff collection")
+            if fresh and stage == "sweep" and sweep is None:
+                if not request_id or not vr.estop:
+                    raise RuntimeError("sweep request needs a token and teleop e-stop")
+                driver.stop_recording_episode()
+                driver._refresh_camera_clock_offsets()
+                sweep = CollectionSweep(driver, request_id)
+                driver._scenediff_session = sweep
+            if sweep is not None and stage in ("align", "teleop"):
+                if sweep.state == "ready":
+                    sweep.begin_alignment()
+                elif sweep.state != "aligned":
+                    raise RuntimeError("leader requested alignment before sweep completion")
+            if sweep is not None and sweep.state != "aligned":
+                try:
+                    sweep.tick()
+                except BaseException:
+                    sweep.close()
+                    raise
+                if status_pub is not None and now - last_status_publish >= status_period:
+                    status = WBCFollowerStatus(
+                        timestamp_ns=time.time_ns(),
+                        stage="sweep",
+                        estop=True,
+                        hold=True,
+                        hold_reason=sweep.detail,
+                        scenediff_enabled=True,
+                        scenediff_request_id=sweep.request_id,
+                        scenediff_state=sweep.state,
+                        scenediff_path=str(sweep.path) if sweep.sha256 else "",
+                        episode_id=_recorder_episode_id(driver),
+                    )
+                    status_pub.publish(asdict(status))
+                    last_status_publish = now
+                prev_estop = True
+                time.sleep(dt)
+                continue
+            if stage in ("align", "teleop") and (
+                not fresh or sweep is None or sweep.state != "aligned"
+            ):
+                driver.stop_all_motion()
+                raise RuntimeError("collection requires first-trigger sweep before alignment")
+
         estop = bool(vr.estop) if vr is not None else True
+        recorder = getattr(driver, "_episode", None)
+        recording_active = recorder is not None and bool(getattr(recorder, "recording", False))
         if estop and hasattr(driver, "stop_recording_episode"):
+            if recording_active:
+                # Streaming close can wait for queued HDF5 writes. Zero/freeze hardware
+                # before that wait so an e-stop never leaves the preceding base command
+                # latched while storage drains.
+                if hasattr(driver, "stop_all_motion"):
+                    driver.stop_all_motion()
             driver.stop_recording_episode()
         if (
             vr is not None
@@ -2148,9 +4585,11 @@ def run_loop(
                 # Homing moves the HARDWARE only. Re-anchor the solver on nominal too, or
                 # it keeps solving the pre-home targets and the gate keeps reporting that
                 # posture's self-collision distance until the next engage.
-                resync_to_nominal("home")
-        if prev_estop and not estop:
-            resync_to_nominal("engage")
+                resync_controller("home")
+        if prev_estop and not estop and not home_required:
+            joint_seed = getattr(sweep, "alignment_joints", None) if sweep is not None else None
+            resync_controller("engage", joint_seed)
+            engage_glide_until = target_now + ENGAGE_GLIDE_S
         prev_estop = estop
 
         left_cmd, right_cmd = vr_to_ee_targets(vr, left_cmd, right_cmd)
@@ -2171,28 +4610,49 @@ def run_loop(
                         f"limit ({DEFAULT_REPLAY_GAP_LIMIT_MULTIPLE:g}x nominal "
                         f"{base_dur:.6g}s); inspect or re-record before replaying."
                     )
-            interp.push(left_cmd, right_cmd, head_cmd, now=now, duration=duration)
+            if not replay and target_now < engage_glide_until:
+                # Engage glide: restart each segment from the CURRENT blended pose (push
+                # normally starts from the previous raw command) and aim it at the end of
+                # the glide window, so successive leader commands refine the destination
+                # without cutting the approach short.
+                interp.reset(*interp.at(target_now))
+                duration = max(duration, engage_glide_until - target_now)
+            interp.push(left_cmd, right_cmd, head_cmd, now=target_now, duration=duration)
             last_cmd_ns = vr.timestamp_ns
+            last_cmd_receive_wall_ns = int(vr_receive_wall_ns)
             last_cmd_wall = now
 
-        left_target, right_target, head_target = interp.at(now)
-        if not replay:
-            # Episode replay re-issues action/head, which THIS loop already wrote through
-            # both filters at record time. Re-filtering would double-apply the LPF lag
-            # (a 2nd-order head response the original take never had), so a replay with an
-            # unedited wbik.yaml would not reproduce its own source. See the --replay
-            # note in the module docstring: head_lpf_tau / head_planar_*_deadband are
-            # baked into the file and are not comparable on this path.
+        left_target, right_target, head_target = interp.at(target_now)
+        head_targets_pre_filtered = bool(getattr(source, "head_targets_pre_filtered", replay))
+        if not head_targets_pre_filtered:
+            # Episode replay re-issues action/head after these filters, while raw leader
+            # stream replay does not. Source provenance -- not the broad ``replay`` flag --
+            # decides whether filtering here would be a duplicate.
             head_target = head_lpf.filter(head_target, dt)
             head_target = head_planar_deadband.filter(head_target)
+        # Joystick torso command (--torso-stick): this tick's torso posture and the hand
+        # targets riding it. Drivers without one solve exactly as before.
+        if hasattr(driver, "update_gripper_collision_geometry"):
+            driver.update_gripper_collision_geometry(ik, dt)
+        solve_kw = {}
+        if hasattr(driver, "torso_targets"):
+            left_target, right_target, torso_joints = driver.torso_targets(
+                left_target, right_target
+            )
+            if torso_joints is not None:
+                solve_kw["torso_joints"] = torso_joints
         if cfg.head_mode == "ik":
-            result = ik.solve(left_target, right_target, dt, head_target=head_target)
+            result = ik.solve(left_target, right_target, dt, head_target=head_target, **solve_kw)
+        elif cfg.head_mode == "fixed":
+            result = ik.solve(left_target, right_target, dt, **solve_kw)  # head pinned at nominal
         else:
             head_joints = ik.solve_head(head_target, dt)
-            result = ik.solve(left_target, right_target, dt, head_joints=head_joints)
+            result = ik.solve(left_target, right_target, dt, head_joints=head_joints, **solve_kw)
 
         hold_reason = driver.extra_hold(now, last_cmd_wall, estop)
         hold = estop or (not result.success) or result.held or (hold_reason is not None)
+        if hasattr(driver, "advance_torso"):
+            driver.advance_torso(ik, hold, dt)  # next tick's torso; this tick's is recorded
         left_gripper = vr.left_gripper if vr is not None else 0.0
         right_gripper = vr.right_gripper if vr is not None else 0.0
         driver.actuate(result, left_gripper, right_gripper, enable, hold, dt)
@@ -2206,6 +4666,8 @@ def run_loop(
                 left_target=left_target,
                 right_target=right_target,
                 head_target=head_target,
+                source_timestamp_ns=int(last_cmd_ns),
+                source_receive_wall_ns=int(last_cmd_receive_wall_ns),
             )
         if status_pub is not None and now - last_status_publish >= status_period:
             status = _build_follower_status(
@@ -2214,7 +4676,14 @@ def run_loop(
                 estop=estop,
                 hold=hold,
                 hold_reason=hold_reason or "",
+                episode_id=_recorder_episode_id(driver),
             )
+            status.scenediff_enabled = sweep_enabled
+            status.home_required = bool(getattr(driver, "home_required", lambda: False)())
+            if sweep is not None:
+                status.scenediff_request_id = sweep.request_id
+                status.scenediff_state = sweep.state
+                status.scenediff_path = str(sweep.path) if sweep.sha256 else ""
             status_pub.publish(asdict(status))
             last_status_publish = now
 
@@ -2280,7 +4749,7 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
     if replay:
         source = ReplaySource.from_episode_hdf5(args.replay, args.speed, clock=clock)
         print(
-            f"[wbc_vr_robot] replay {args.replay}: {len(source._vr)} frames, "  # noqa: SLF001
+            f"[wbc_vr_robot] replay {args.replay}: {len(source._vr)} frames, "
             f"{source.total_duration:.1f}s at {args.speed:g}x (recorded action targets; "
             "head LPF/deadband bypassed -- already baked into the take)"
         )
@@ -2293,10 +4762,10 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
     debug_start_id = 0
     traj: Optional[_TrajLog] = None
     if args.debug_dir is not None:
-        import os  # noqa: PLC0415
+        import os
 
         os.makedirs(args.debug_dir, exist_ok=True)
-        # With --record, each saved
+        # Match vr_reader's DebugEpisodeRecorder naming. With --record, each saved
         # episode_<N>.hdf5 gets its episode_<N>_debug.hdf5 flushed (buffer freed) as it
         # saves, keyed by the recorder's ACTUAL id -- so this peek is only the STARTING id
         # (for the print, and for the single teardown file when --record is off).
@@ -2349,6 +4818,12 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
         f"base_post_deadband={args.base_post_linear_deadband:g}m/s/"
         f"{args.base_post_angular_deadband:g}rad/s"
     )
+    if args.arkit_base != "off":
+        print(
+            f"  base pose -> iPhone/ARKit '{args.arkit_base}' "
+            f"({'closes the base PD loop' if args.arkit_base == 'control' else 'recorded only'}"
+            "; wheel odometry always recorded)."
+        )
     print(
         f"  joints -> dexcontrol 1:1 (urdf {cfg.urdf_path.rsplit('/', 1)[-1]}). "
         "Robot homes to nominal, then moves. KEEP CLEAR. Ctrl-C aborts (zeros base)."
@@ -2400,6 +4875,26 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
         # otherwise the operator only sees a stale "Stage: teleop" while the robot
         # freezes (e.g. the --record camera-freshness abort). Then re-raise.
         _publish_abort_status(source, exc)
+        if driver is not None:
+            try:
+                driver.abort_recording_episode(str(exc))
+            except Exception as quarantine_exc:
+                print(
+                    "[wbc_vr_robot] WARNING: failed to quarantine the aborted "
+                    f"episode: {quarantine_exc}"
+                )
+                # Never let finally->driver.close() run the normal complete-save path
+                # after quarantine itself failed. Losing forensic rows is preferable to
+                # publishing a runtime-failed take as valid training data.
+                episode = getattr(driver, "_episode", None)
+                if episode is not None and getattr(episode, "recording", False):
+                    try:
+                        episode.discard()
+                    except Exception as discard_exc:
+                        print(
+                            "[wbc_vr_robot] WARNING: failed to discard the "
+                            f"unquarantined take: {discard_exc}"
+                        )
         raise
     finally:
         if hasattr(source, "close"):
@@ -2447,6 +4942,12 @@ def main() -> None:
         help="drive from the live leader (default when --replay is omitted).",
     )
     parser.add_argument(
+        "--speed",
+        type=float,
+        default=DEFAULT_SPEED,
+        help=f"replay speed multiplier (default {DEFAULT_SPEED:g}; <1 = slower).",
+    )
+    parser.add_argument(
         "--enable",
         default="arms,torso,head,base",
         help="comma list of DOF groups to actuate: any of "
@@ -2481,7 +4982,7 @@ def main() -> None:
     parser.add_argument(
         "--record",
         action="store_true",
-        help="record an HDF5 episode while "
+        help="record an episode (vr_reader EpisodeRecorder format) while "
         "engaged: action+obs joints (incl. torso), gripper obs/action, "
         "selected head RGB/depth streams and {left,right}_wrist_rgb "
         "(left/right = ARM), a static intrinsic, "
@@ -2516,6 +5017,15 @@ def main() -> None:
         "requires --record.",
     )
     parser.add_argument(
+        "--wrist-right-rgb",
+        action="store_true",
+        help="also record each wrist camera's rectified right eye and "
+        "timestamp, plus each live stereo baseline/intrinsics for "
+        "offline FoundationStereo. Existing {left,right}_wrist_rgb "
+        "remain the LEFT eyes. Requires both wrist publishers started "
+        "with --no-skip-right-rgb and requires --record.",
+    )
+    parser.add_argument(
         "--save-dir",
         default=DEFAULT_SAVE_DIR,
         help=f"directory for recorded episodes (default {DEFAULT_SAVE_DIR}).",
@@ -2536,6 +5046,35 @@ def main() -> None:
         f"aborting the take (default {DEFAULT_RECORD_STALE_GRACE:g}; "
         "0 aborts on the first stale tick). Rides out short WiFi/Zenoh "
         "delivery stalls without ever recording duplicate frames.",
+    )
+    parser.add_argument(
+        "--record-startup-timeout",
+        type=float,
+        default=DEFAULT_RECORD_STARTUP_TIMEOUT,
+        help="seconds allowed before frame zero for multiple advancing frames from "
+        "the head and both wrists plus one capture-aligned set (default "
+        f"{DEFAULT_RECORD_STARTUP_TIMEOUT:g}). This does not relax the shorter "
+        "--record-stale-grace after recording begins.",
+    )
+    parser.add_argument(
+        "--record-max-camera-skew-ms",
+        type=float,
+        default=DEFAULT_RECORD_MAX_CAMERA_SKEW_MS,
+        help="maximum absolute capture-time skew between the head and EACH wrist in "
+        "a saved row, after per-camera clock correction (default "
+        f"{DEFAULT_RECORD_MAX_CAMERA_SKEW_MS:g} ms). Camera subscriber caches are "
+        "sampled at the IK rate; the freshest buffered head anchor whose closest "
+        "unused wrist frames pass is selected. A row is retried then aborted when "
+        "no set satisfies the limit. 0 restores legacy latest-arrived pairing.",
+    )
+    parser.add_argument(
+        "--record-max-camera-age-ms",
+        type=float,
+        default=DEFAULT_RECORD_MAX_CAMERA_AGE_MS,
+        help="maximum camera capture-to-selection age after publisher-clock "
+        f"correction (default {DEFAULT_RECORD_MAX_CAMERA_AGE_MS:g} ms). "
+        "Fresh but backlogged streams are retried then abort the take instead "
+        "of silently pairing old images with current robot state/action.",
     )
 
     hw = parser.add_argument_group("hardware")
@@ -2558,12 +5097,28 @@ def main() -> None:
         "lag so the gate snapshot is settled, not mid-flight.",
     )
     hw.add_argument(
+        "--home-speed",
+        type=float,
+        default=None,
+        help="pace nominal homing at this joint speed in rad/s (default: "
+        "unpaced -- each 0.01 rad substep runs at the joint velocity "
+        "limit). Lower = slower, easier to watch and abort.",
+    )
+    hw.add_argument(
         "--max-joint-step",
         type=float,
         default=DEFAULT_MAX_JOINT_STEP,
         help=f"per-tick joint command clamp (rad), arms/torso/head (default "
         f"{DEFAULT_MAX_JOINT_STEP:g}; 0 disables). Repeatedly exceeding 2x "
         "this aborts the run.",
+    )
+    hw.add_argument(
+        "--arm-cmd-lpf-tau",
+        type=float,
+        default=DEFAULT_ARM_CMD_LPF_TAU,
+        help="first-order low-pass time constant (s) on the arm joint commands "
+        "feeding the velocity feedforward (default "
+        f"{DEFAULT_ARM_CMD_LPF_TAU:g}; 0 disables).",
     )
     hw.add_argument(
         "--source-timeout",
@@ -2577,6 +5132,21 @@ def main() -> None:
         choices=("ms", "rad"),
         default="ms",
         help="swerve wheel_velocity units for odometry (default 'ms').",
+    )
+    hw.add_argument(
+        "--arkit-base",
+        dest="arkit_base",
+        choices=("off", "record", "control"),
+        default="off",
+        help="use the mount-rigid iPhone (ARKit) as a drift-free base-pose "
+        "sensor. 'record': log it beside the wheel odometry "
+        "(obs/base/pose_arkit + pose_arkit_world, arkit_* /debug columns) "
+        "while odometry still closes the base PD loop -- measure the drift "
+        "before depending on it. 'control': also feed it to the base PD as "
+        "the MEASURED pose, holding the base on a stale ('stale-arkit') or "
+        "relocalized ('arkit-jump') tracker. Needs --enable base, "
+        "$ROBOT_NAME, and the robot-side publisher "
+        "(scripts/base_tracking/base_pose_pub.py). Default 'off'.",
     )
     hw.add_argument(
         "--base-quiet-hold-s",
@@ -2600,11 +5170,19 @@ def main() -> None:
     for flag, val in (
         ("--home-tol", args.home_tol),
         ("--max-joint-step", args.max_joint_step),
+        ("--arm-cmd-lpf-tau", args.arm_cmd_lpf_tau),
         ("--home-settle", args.home_settle),
         ("--record-stale-grace", args.record_stale_grace),
+        ("--record-max-camera-skew-ms", args.record_max_camera_skew_ms),
     ):
         if not np.isfinite(val) or val < 0.0:
             parser.error(f"{flag} must be finite and >= 0")
+    if args.home_speed is not None and (not np.isfinite(args.home_speed) or args.home_speed <= 0):
+        parser.error("--home-speed must be finite and > 0")
+    if not np.isfinite(args.record_max_camera_age_ms) or args.record_max_camera_age_ms <= 0.0:
+        parser.error("--record-max-camera-age-ms must be finite and > 0")
+    if not np.isfinite(args.record_startup_timeout) or args.record_startup_timeout <= 0.0:
+        parser.error("--record-startup-timeout must be finite and > 0")
     if not np.isfinite(args.base_quiet_hold_s):
         parser.error("--base-quiet-hold-s must be finite")
     for flag, val in (
@@ -2617,6 +5195,7 @@ def main() -> None:
         ("--streaming-recorder", args.streaming_recorder),
         ("--no-head-depth", args.no_head_depth),
         ("--head-right-rgb", args.head_right_rgb),
+        ("--wrist-right-rgb", args.wrist_right_rgb),
     ):
         if enabled and not args.record:
             parser.error(f"{flag} only affects recording; pass it with --record")
@@ -2629,6 +5208,13 @@ def main() -> None:
         enable = parse_enable_mask(args.enable)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.arkit_base != "off" and not enable["base"]:
+        parser.error(
+            "--arkit-base needs --enable base: the iPhone tracker rides alongside "
+            "the wheel odometry (which still supplies obs/joint/chassis_* and the "
+            "/debug wheel inputs), and it never drives a base that is not enabled."
+        )
+
     _run_ik_mode(args, enable)
 
 

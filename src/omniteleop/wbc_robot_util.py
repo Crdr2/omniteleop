@@ -98,25 +98,12 @@ def base_quiet_dispatch(
     quiet_hold_s: float,
     quiet_eps: float = 1e-6,
 ) -> tuple[str, float]:
-    """Decide the chassis dispatch for one follower base tick, advancing the quiet timer.
+    """Choose (drive/hold/recenter, quiet_elapsed_s) for one chassis tick.
 
-    A swerve base re-centers its wheels to 0deg whenever it is sent a zero twist
-    (``set_velocity(0,0,0)`` -> ``_compute_wheel_control`` maps zero speed to steering 0).
-    During an active strafe/turn the shaped command dips to zero on brief gaps (leader
-    10 Hz updates, pauses, decel), which snaps the wheels lateral->forward and back. To
-    suppress that intra-motion chatter, hold the current steering with zero drive. A
-    positive ``quiet_hold_s`` re-centers after that window; a negative value never
-    re-centers during quiet gaps.
-
-    Returns ``(action, quiet_elapsed_s)``; thread ``quiet_elapsed_s`` back in next tick:
-
-    * ``"drive"``    -- ``max|cmd| > quiet_eps``: command is active, send the twist
-      (timer reset to 0).
-    * ``"hold"``     -- quiet and quiet for ``< quiet_hold_s``, or ``quiet_hold_s < 0``:
-      hold the current steering, zero drive (caller: ``chassis.set_wheel_velocity(0.0)``).
-    * ``"recenter"`` -- quiet for ``>= quiet_hold_s`` (or ``quiet_hold_s == 0``): send a
-      zero twist for a clean straight rest (caller: ``set_velocity(0,0,0)``). The
-      ``0`` case reproduces the original always-re-center behavior.
+    An active twist resets the timer and drives. Quiet commands retain steering
+    with zero wheel drive until quiet_hold_s expires, then send a zero twist to
+    recenter. A negative hold never recenters; zero recenters immediately.
+    Pass the returned elapsed time into the next call.
     """
     cmd = np.asarray(cmd, dtype=float)
     if cmd.shape != (3,):

@@ -1,21 +1,8 @@
-"""Swerve-drive forward-kinematics odometry for the Vega-1 chassis.
+"""Estimate planar Vega base motion from front-wheel steering and drive states.
 
-Pure numpy, with no ROS dependency. Positive wheel speed follows each wheel's
-rolling direction in the URDF frame.
-
-Geometry (from dexmate_urdf vega_1.urdf, matches omniteleop wbc_swerve.py):
-  - two steered wheel modules at L=(0.185, 0.225), R=(0.185, -0.225) [m, base frame]
-  - steer joints rotate about -z  =>  wheel heading in base frame = -steer_angle
-  - drive joints: L about +y, R about -y  =>  positive joint speed drives the
-    robot toward +x with sign DRIVE_SIGN = [+1, -1]
-  - wheel radius 0.0861 m (calibrated value from wbc_swerve.py)
-
-Twist estimation: weighted least squares over 4 constraint rows (2 per wheel).
-For wheel i at p=(px,py) with heading theta, the ground-contact velocity of a
-rigid body with twist (vx, vy, w) is v_i = (vx - w*py, vy + w*px).
-  rolling row : v_i . (cos t, sin t)  = s_i   (measured contact speed)
-  lateral row : v_i . (-sin t, cos t) = 0     (no-slip, down-weighted: violated
-                                               during steering transients)
+Drive modes interpret samples as contact m/s or signed wheel rad/s. The lateral
+constraint weight controls how strongly the least-squares wheel model resists
+slip. Timestamp-driven integration skips stale samples and caps dropout steps.
 """
 
 from __future__ import annotations
@@ -121,14 +108,13 @@ def integrate_se2(pose: np.ndarray, twist: np.ndarray, dt: float) -> np.ndarray:
         dy_l = (vx * (1.0 - cos_wt) + vy * sin_wt) / w
         dyaw = wt
     cy, sy = np.cos(yaw), np.sin(yaw)
-    new = np.array(
+    return np.array(
         [
             x + cy * dx_l - sy * dy_l,
             y + sy * dx_l + cy * dy_l,
             np.arctan2(np.sin(yaw + dyaw), np.cos(yaw + dyaw)),
         ]
     )
-    return new
 
 
 class SwerveOdometry:
@@ -182,24 +168,11 @@ class SwerveOdometry:
         return self.pose
 
     def update_at(self, steer_pos, drive_vel, t_ns: int) -> np.ndarray:
-        """Timestamp-driven integration from a measured sample timestamp.
+        """Integrate from the wheel sample's firmware timestamp in nanoseconds.
 
-        ``t_ns`` is the firmware/state timestamp (nanoseconds) of this wheel
-        sample. ``dt`` is derived from the previous integrated sample's timestamp
-        -- not the caller's loop period -- so the integral is independent of
-        polling jitter and robust to dropped/stale samples:
-
-          * first sample (or just after construction): the timestamp is latched
-            and nothing is integrated (``dt`` is unknown); pose is returned as-is.
-          * non-advancing sample (``t_ns <=`` last integrated -- e.g. a cached
-            ``get_latest()`` value polled faster than it refreshes): skipped, so a
-            stalled stream does NOT dead-reckon a stale velocity forward.
-          * advancing sample: ``dt = (t_ns - prev) * 1e-9``, clamped to ``max_dt``
-            to bound the jump across a dropout. Non-finite/out-of-range data
-            raises ``OdometryInputError`` (via ``update``) without advancing the
-            timestamp, so a later good sample integrates across the gap.
-
-        Returns the current pose for the latched/stale cases.
+        The first sample latches time without moving; non-advancing stamps are skipped.
+        Advancing samples use their elapsed time, capped by max_dt. Invalid measurements
+        raise before updating the timestamp, allowing the next good sample to span the gap.
         """
         t_ns = int(t_ns)
         if self._prev_ts_ns is not None and t_ns > self._prev_ts_ns:

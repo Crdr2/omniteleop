@@ -1,0 +1,33 @@
+{
+  "_what": "Where 07_estop_tower_cradle.stl sits on the Vega. See PLACEMENT.md. All points in the URDF `base` link frame, millimetres.",
+  "urdf": "${omniteleop}/assets/vega_with_robotiq.urdf",
+  "frame": "base",
+  "frame_axes": {"x": "forward", "y": "left", "z": "up"},
+  "frame_origin": "chassis centre (base mesh spans x -345..345, y -275..275, z -3.5..347); floor at z ~ -54",
+  "units": "mm",
+  "T_base_from_stl": [[0.001, 0, 0, 0], [0, 0.001, 0, 0], [0, 0, 0.001, 0], [0, 0, 0, 1]],
+  "T_base_from_stl_note": "STL vertices are already base-frame mm; this matrix converts them to base-frame metres (URDF units). No rotation, no offset.",
+  "part_bounds_mm": [[109.0, 190.0, 281.72], [189.0, 290.0, 524.8]],
+  "ledge": {
+    "button_axis_point_mm": [149.0, 240.0, 290.95],
+    "normal": [0.0, 0.34202, 0.93969],
+    "tilt_deg_from_vertical_toward_plus_y": 20.0,
+    "note": "The left E-stop's seating ledge. The skirt (OD 54 / ID 40, 20.5 tall) sits on this plane around the button."
+  },
+  "anchors_mm": {
+    "rear_bolt": [125.5, 240.0, 290.95],
+    "front_bolt": [172.5, 240.0, 290.95]
+  },
+  "anchors_note": "Two M4 E-stop screw holes, axis = ledge normal. The CAD scripts and README call x=125.5 'forward'; that label is wrong, +x is the robot's front.",
+  "tower_plate_mm": {"x": [109.0, 189.0], "y": [190.0, 290.0], "z": [316.0, 328.0]},
+  "cradle": {
+    "origin_mm": [149.0, 240.0, 328.0],
+    "local_to_base": {"X": "+y", "Y": "-x", "Z": "+z"},
+    "note": "Cradle local frame from 02_iphone_cradle.py: X across the phone, Y from back panel toward the screen, Z up from the base-plate underside. Phone back (camera) faces +x, screen faces -x (toward the torso)."
+  },
+  "phone_camera": {
+    "cad_nominal_mm": [149.0, 227.0, 494.0],
+    "optical_axis": [1.0, 0.0, 0.0],
+    "note": "Nominal is a +-20 mm estimate from CAD. Measure the phone-to-base extrinsic on each installation with scripts/base_tracking/calibration; do not use the CAD pose as a calibration."
+  }
+}

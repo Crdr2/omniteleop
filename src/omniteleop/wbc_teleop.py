@@ -1,28 +1,15 @@
 #!/usr/bin/env python3
-"""Shared configuration and transport for whole-body VR teleoperation.
+"""Shared teleoperation configuration and live Zenoh command subscription.
 
-* :class:`VRTeleopConfig` -- the shared leader stick mapping and control-loop tunables
-  (control/command rates, head-target low-pass/deadband, base PD gains, base command
-  slew / clamp / post-deadband, replay speed) that shape the low-rate leader stream and
-  whole-body IK. They live in the
-  ``vr_teleop:`` block of the canonical ``follower/wbik.yaml`` (the single follower
-  config file, beside the WBC *solver* tunables) and are loaded here so the leader and
-  follower bind identical defaults. ``WBCConfig.from_yaml`` ignores that block
-  (it is a follower-loop parameter, not a solver parameter -- see ``_NON_WBC_SECTIONS``
-  in ``omniteleop.follower.whole_body_ik``).
-* :class:`VRJointSubscriber` -- the live Zenoh source for the leader's ``vr/joints``
-  ``VRJointData`` stream. It mirrors :class:`omniteleop.wbc_record.ReplaySource`'s
-  ``latest`` / ``done`` / ``segment_duration`` / ``start`` / ``close`` surface so the
-  follower loop is source-agnostic (live subscriber vs file replay).
-
-Depends only on ``yaml`` + ``dexcomm`` + ``omniteleop.common`` -- no robot or solver
-and, crucially, no ``omniteleop.follower`` package ``__init__`` (heavy, hardware deps).
-That keeps it safe to import without robot or solver dependencies.
+VRTeleopConfig, JoystickTeleopConfig, and JoystickTorsoConfig read their sections
+of follower/wbik.yaml. VRJointSubscriber exposes the same latest/done/timing
+interface as ReplaySource. Importing this module does not load solver hardware.
 """
 
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -34,20 +21,20 @@ from dexcomm.codecs import DictDataCodec
 from omniteleop.common import get_config
 from omniteleop.common.schemas import VRJointData
 
-# The shared follower config file: the vr_teleop: block sits beside the WBC solver
-# tunables in follower/wbik.yaml (the single source of truth). VRTeleopConfig reads ONLY
-# that block; WBCConfig reads only the solver keys and skips vr_teleop (see its
-# from_yaml / _NON_WBC_SECTIONS). Absolute path => loadable from any working directory.
+# Canonical control-loop YAML; each loader validates only its own section.
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("follower") / "wbik.yaml"
 VR_TELEOP_SECTION = "vr_teleop"
-# Fields the followers require to be STRICTLY positive (their argparse validation rejects
-# <= 0): replay/loop rates, stick maxima, base-twist slew, and a base-velocity clamp of 0
-# are degenerate. The rest are disable-at-zero tunables (deadbands, the LPF tau, PD gains,
-# and cmd_rate -- 0 disables interpolation) and may be 0.
+JOYSTICK_TELEOP_SECTION = "joystick_teleop"
+JOYSTICK_TORSO_SECTION = "joystick_torso"
+# These settings must be positive; other numeric fields may use zero
+# to disable an effect (including command interpolation).
 _STRICTLY_POSITIVE_FIELDS = frozenset(
     {
         "replay_speed",
         "ik_rate",
+        "stick_max_vx",
+        "stick_max_vy",
+        "stick_max_wz",
         "base_accel",
         "base_max_speed",
     }
@@ -60,7 +47,8 @@ class VRTeleopConfig:
     """Shared command-stream tunables for the whole-body VR followers.
 
     Loaded from the ``vr_teleop:`` block of ``follower/wbik.yaml`` (see
-    :meth:`from_yaml`); the leader and follower share these values. The fields have no
+    :meth:`from_yaml`); both followers bind their argparse defaults to these so the
+    head/base command shaping is identical in sim and on hardware. The fields have no
     in-code defaults on purpose -- the YAML is the single source of truth, so a missing
     key is an error rather than a silent fallback.
     """
@@ -68,6 +56,10 @@ class VRTeleopConfig:
     replay_speed: float  # replay speed multiplier (<1 = slower)
     ik_rate: float  # whole-body IK / control loop rate (Hz)
     cmd_rate: float  # leader command rate (Hz), interpolated to ik_rate
+    stick_max_vx: float  # full-scale forward/back thumbstick speed (m/s)
+    stick_max_vy: float  # full-scale strafe thumbstick speed (m/s)
+    stick_max_wz: float  # full-scale yaw thumbstick speed (rad/s)
+    stick_deadzone: float  # per-axis raw thumbstick deadzone in [0, 1)
     head_lpf_tau: float  # head-target low-pass time constant (s); 0 disables
     head_planar_pos_deadband: float  # radial x/y head-target deadband (m)
     head_planar_yaw_deadband: float  # heading-yaw head-target deadband (rad)
@@ -133,6 +125,114 @@ class VRTeleopConfig:
                     f"got {raw!r}"
                 )
             values[name] = value
+        if values["stick_deadzone"] >= 1.0:
+            raise ValueError(
+                f"{cfg_path}: {VR_TELEOP_SECTION}.stick_deadzone must be < 1, "
+                f"got {values['stick_deadzone']!r}"
+            )
+        if not math.isclose(values["stick_max_vx"], values["stick_max_vy"]):
+            raise ValueError(
+                f"{cfg_path}: {VR_TELEOP_SECTION}.stick_max_vx and stick_max_vy "
+                "must match so planar intent normalization is unbiased"
+            )
+        return cls(**values)
+
+
+@dataclass(frozen=True)
+class JoystickTeleopConfig:
+    """Joystick-specific direction and speed policy from ``joystick_teleop``."""
+
+    translation_speed: float
+    rotation_speed: float
+    single_axis_hysteresis_ratio: float
+    reference_lead_xy: float  # max integrated-reference lead over the measured pose (m)
+    reference_lead_yaw: float  # same for heading (rad); 0 = pure velocity command
+    head_mode: str  # "track" (neck follows the headset) or "fixed" (nominal)
+
+    HEAD_MODES = ("track", "fixed")
+
+    @classmethod
+    def from_yaml(cls, path: Optional[Union[str, Path]] = None) -> "JoystickTeleopConfig":
+        """Load and validate the required ``joystick_teleop`` YAML section."""
+        cfg_path = DEFAULT_CONFIG_PATH if path is None else Path(path)
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict) or JOYSTICK_TELEOP_SECTION not in data:
+            raise ValueError(f"{cfg_path}: missing required '{JOYSTICK_TELEOP_SECTION}:' section")
+        block = data[JOYSTICK_TELEOP_SECTION]
+        if not isinstance(block, dict):
+            raise ValueError(
+                f"{cfg_path}: '{JOYSTICK_TELEOP_SECTION}' must be a mapping, got "
+                f"{type(block).__name__}"
+            )
+        names = {f.name for f in fields(cls)}
+        unknown = sorted(set(block) - names)
+        if unknown:
+            raise ValueError(f"{cfg_path}: unknown {JOYSTICK_TELEOP_SECTION} keys {unknown}")
+        missing = sorted(names - set(block))
+        if missing:
+            raise ValueError(f"{cfg_path}: missing {JOYSTICK_TELEOP_SECTION} keys {missing}")
+        values = {}
+        for name in names:
+            raw = block[name]
+            if name == "head_mode":
+                if raw not in cls.HEAD_MODES:
+                    raise ValueError(
+                        f"{cfg_path}: {JOYSTICK_TELEOP_SECTION}.head_mode must be one of "
+                        f"{cls.HEAD_MODES}, got {raw!r}"
+                    )
+                values[name] = str(raw)
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{cfg_path}: {JOYSTICK_TELEOP_SECTION}.{name} must be a number, got {raw!r}"
+                ) from None
+            strictly_positive = name in {"translation_speed", "rotation_speed"}
+            invalid = not math.isfinite(value) or (
+                value <= 0.0 if strictly_positive else value < 0.0
+            )
+            if invalid:
+                bound = "> 0" if strictly_positive else ">= 0"
+                raise ValueError(
+                    f"{cfg_path}: {JOYSTICK_TELEOP_SECTION}.{name} must be finite and "
+                    f"{bound}, got {raw!r}"
+                )
+            values[name] = value
+        return cls(**values)
+
+
+@dataclass(frozen=True)
+class JoystickTorsoConfig:
+    """Joystick torso policy from ``joystick_torso`` (read only with --torso-stick)."""
+
+    speed: float  # fixed torso-height speed (m/s) for any stick direction past the deadzone
+
+    @classmethod
+    def from_yaml(cls, path: Optional[Union[str, Path]] = None) -> "JoystickTorsoConfig":
+        """Load and validate the ``joystick_torso`` YAML section."""
+        cfg_path = DEFAULT_CONFIG_PATH if path is None else Path(path)
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        block = data.get(JOYSTICK_TORSO_SECTION) if isinstance(data, dict) else None
+        keys = {"speed"}
+        if not isinstance(block, dict) or set(block) != keys:
+            raise ValueError(
+                f"{cfg_path}: --torso-stick needs a '{JOYSTICK_TORSO_SECTION}:' "
+                f"mapping with exactly the keys {sorted(keys)}, got {block!r}"
+            )
+        values = {}
+        for key in sorted(keys):
+            try:
+                values[key] = float(block[key])
+            except (TypeError, ValueError):
+                values[key] = float("nan")
+            if not math.isfinite(values[key]) or values[key] <= 0.0:
+                raise ValueError(
+                    f"{cfg_path}: {JOYSTICK_TORSO_SECTION}.{key} must be finite and > 0, "
+                    f"got {block[key]!r}"
+                )
         return cls(**values)
 
 
@@ -158,15 +258,31 @@ def bind_vr_teleop_args(args, config: VRTeleopConfig, *, head_track: bool = Fals
     args.base_post_angular_deadband = config.base_post_angular_deadband
 
 
+def bind_joystick_teleop_args(
+    args, vr_config: VRTeleopConfig, joystick_config: JoystickTeleopConfig
+) -> None:
+    """Bind shared joystick direction-selection and fixed-speed policy."""
+    args.joystick_stick_max_vx = vr_config.stick_max_vx
+    args.joystick_stick_max_vy = vr_config.stick_max_vy
+    args.joystick_stick_max_wz = vr_config.stick_max_wz
+    args.joystick_translation_speed = joystick_config.translation_speed
+    args.joystick_rotation_speed = joystick_config.rotation_speed
+    args.joystick_single_axis_hysteresis_ratio = joystick_config.single_axis_hysteresis_ratio
+    args.joystick_reference_lead_xy = joystick_config.reference_lead_xy
+    args.joystick_reference_lead_yaw = joystick_config.reference_lead_yaw
+    args.joystick_head_mode = joystick_config.head_mode
+
+
 class VRJointSubscriber:
     """Subscribe to ``vr/joints``; keep the latest frame and optionally tee every frame.
 
     The live counterpart to :class:`omniteleop.wbc_record.ReplaySource`: it exposes the
     same ``latest`` / ``done`` / ``segment_duration`` / ``start`` / ``close`` surface so
-    the follower runs the same loop over either source. ``sink`` (optional) is called
-    with every received frame for lightweight instrumentation or stream monitoring
-    without affecting the follower loop -- a sink exception never drops
-    the subscription. ``name`` is the Zenoh node name.
+    both followers run the SAME loop over either source. ``sink`` (optional) is called
+    with every received frame for lightweight instrumentation (e.g. the sim follower's
+    stream recording) without affecting the follower loop -- a sink exception never drops
+    the subscription. ``name`` is the Zenoh node name; the two followers pass distinct
+    names (``wbc_vr_record`` / ``wbc_vr_robot``).
     """
 
     def __init__(
@@ -179,17 +295,24 @@ class VRJointSubscriber:
         self.node = Node(name=name, namespace=namespace)
         self.topic = get_config().get_topic("vr_joints", "vr/joints")
         self._latest: Optional[VRJointData] = None
+        # Replace the decoded command together with the local wall-clock instant at
+        # which its subscriber callback ran. The follower records this separately from
+        # VRJointData.timestamp_ns (leader publish time), making delivery/queue latency
+        # measurable instead of folding it into the episode commit timestamp.
+        self._latest_sample: Optional[tuple[VRJointData, int]] = None
         self._sink = sink
         self.sub = self.node.create_subscriber(
             self.topic, self._on_msg, decoder=DictDataCodec.decode
         )
 
     def _on_msg(self, data: dict) -> None:
+        receive_wall_ns = time.time_ns()
         try:
             vr = VRJointData(**data)
         except (TypeError, ValueError):
             return  # ignore malformed frames
         self._latest = vr
+        self._latest_sample = (vr, receive_wall_ns)
         if self._sink is not None:
             try:
                 self._sink(vr)
@@ -200,6 +323,15 @@ class VRJointSubscriber:
     def latest(self) -> Optional[VRJointData]:
         """Most recently received ``VRJointData`` (None before the first frame)."""
         return self._latest
+
+    @property
+    def latest_sample(self) -> Optional[tuple[VRJointData, int]]:
+        """Latest command plus its local subscriber-callback wall timestamp.
+
+        The tuple is replaced in one assignment, so the command and receive stamp cannot
+        be torn across two Zenoh callbacks when the 100 Hz follower reads them.
+        """
+        return self._latest_sample
 
     @property
     def done(self) -> bool:

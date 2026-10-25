@@ -1,4 +1,5 @@
-"""Buffered HDF5 episode recorder for the whole-body robot follower.
+"""Shared episode recorder used by leader (`vr_reader`) and follower
+(`policy_rollout`) scripts.
 
 Frames are accumulated in memory as nested dicts of numpy arrays during an
 episode and dumped to a single HDF5 file in a daemon thread on `stop()`.
@@ -9,6 +10,7 @@ from __future__ import annotations
 import pathlib
 import re
 import threading
+import time
 from collections.abc import Callable
 from typing import Any, Optional
 
@@ -48,13 +50,16 @@ def _merge_static(stacked: dict, static: dict) -> None:
 
 
 def _count_leaves(d: dict) -> int:
-    n = 0
-    for v in d.values():
-        n += _count_leaves(v) if isinstance(v, dict) else 1
-    return n
+    return sum(_count_leaves(value) if isinstance(value, dict) else 1 for value in d.values())
 
 
-def _save_dict_with_progress(data: dict, path: str, on_progress: Callable[[float], None]) -> None:
+def _save_dict_with_progress(
+    data: dict,
+    path: str,
+    on_progress: Callable[[float], None],
+    *,
+    attrs: Optional[dict[str, Any]] = None,
+) -> None:
     """Save nested dict-of-ndarrays to HDF5; ``on_progress(frac in [0,1])`` is
     called repeatedly as datasets are written. Large arrays are chunked along
     axis 0 so the bar advances smoothly mid-leaf.
@@ -93,12 +98,8 @@ def _save_dict_with_progress(data: dict, path: str, on_progress: Callable[[float
     on_progress(0.0)
     with h5py.File(path, "w") as h5file:
         recurse(h5file, "/", data)
-
-
-def _progress_bar(p: float, width: int = 15) -> str:
-    p = max(0.0, min(1.0, p))
-    filled = int(round(width * p))
-    return "[" + "#" * filled + "-" * (width - filled) + f"] {p * 100:3.0f}%"
+        for key, value in (attrs or {}).items():
+            h5file.attrs[key] = value
 
 
 def peek_next_episode_id(save_dir: str, *, suffix: str = "") -> int:
@@ -108,8 +109,8 @@ def peek_next_episode_id(save_dir: str, *, suffix: str = "") -> int:
     """
     save_path = pathlib.Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
-    pattern = f"episode_*{suffix}.hdf5"
-    id_re = re.compile(rf"episode_(\d+){re.escape(suffix)}\.hdf5$")
+    pattern = f"episode_*{suffix}.hdf5*"
+    id_re = re.compile(rf"episode_(\d+){re.escape(suffix)}\.hdf5(?:\.partial(?:\.tmp)?)?$")
     existing_ids = (
         int(match.group(1))
         for p in save_path.glob(pattern)
@@ -132,10 +133,19 @@ class EpisodeRecorder:
         self._save_thread: Optional[threading.Thread] = None
         self.last_save_error: BaseException | None = None
         self.episode_id = peek_next_episode_id(save_dir)
+        self._save_invalidated = threading.Event()
+        self._invalidation_reason: Optional[str] = None
+        self._disposition_lock = threading.Lock()
+        self._active_save_target: Optional[pathlib.Path] = None
+        self._active_save_complete = True
 
     def start(self) -> None:
         """Start a new episode recording."""
+        if self.saving:
+            raise RuntimeError("EpisodeRecorder.start() while the previous episode is still saving")
         self._frames = []
+        self._save_invalidated.clear()
+        self._invalidation_reason = None
         self.recording = True
         logger.info("EpisodeRecorder: recording started")
 
@@ -168,6 +178,8 @@ class EpisodeRecorder:
         self.episode_id += 1
         self.last_save_error = None
         self.saving = True
+        self._active_save_target = path
+        self._active_save_complete = True
         self.save_progress = 0.0
         self._save_thread = threading.Thread(
             target=self._save_worker, args=(frames, str(path), self._static), daemon=True
@@ -180,7 +192,55 @@ class EpisodeRecorder:
         self.recording = False
         self._frames = []
 
-    def _save_worker(self, frames: list[dict], path: str, static: dict) -> None:
+    def abort(self, reason: str) -> Optional[str]:
+        """Save an exception-truncated buffered take as incomplete ``.partial``."""
+        if not self.recording:
+            return None
+        self.recording = False
+        if not self._frames:
+            self._frames = []
+            return None
+        path = self._save_dir / f"episode_{self.episode_id}.hdf5.partial"
+        frames = self._frames
+        self._frames = []
+        self.episode_id += 1
+        self.last_save_error = None
+        self.saving = True
+        self._active_save_target = path
+        self._active_save_complete = False
+        self.save_progress = 0.0
+        self._save_thread = threading.Thread(
+            target=self._save_worker,
+            args=(frames, str(path), self._static, False, str(reason)),
+            daemon=True,
+        )
+        self._save_thread.start()
+        return str(path)
+
+    def invalidate_save(self, reason: str) -> Optional[str]:
+        """Force an in-flight save to finish only under an incomplete partial name."""
+        with self._disposition_lock:
+            if not self.saving or self._active_save_target is None:
+                return None
+            self._invalidation_reason = str(reason)
+            self._save_invalidated.set()
+            target = self._active_save_target
+            return str(target) if not self._active_save_complete else f"{target}.partial"
+
+    def _save_worker(
+        self,
+        frames: list[dict],
+        path: str,
+        static: dict,
+        complete: bool = True,
+        abort_reason: Optional[str] = None,
+    ) -> None:
+        target = pathlib.Path(path)
+        # Publish a normal training-visible .hdf5 only after a completely successful
+        # close. An aborted target is already quarantined, but it also gets a staging
+        # suffix so an I/O failure cannot leave a file that looks intentionally saved.
+        staging = pathlib.Path(f"{target}.partial") if complete else pathlib.Path(f"{target}.tmp")
+        published_final = False
         try:
             data = _recursive_np_stack(frames)
             _merge_static(data, static)
@@ -188,13 +248,73 @@ class EpisodeRecorder:
             def on_progress(p: float) -> None:
                 self.save_progress = p
 
-            _save_dict_with_progress(data, path, on_progress)
-            logger.info(f"EpisodeRecorder: {len(frames)} frames → {path}")
+            attrs: dict[str, Any] = {
+                "complete": bool(complete),
+                "n_frames": len(frames),
+            }
+            if abort_reason is not None:
+                attrs["abort_reason"] = abort_reason
+            if not complete:
+                attrs["abort_wall_ns"] = time.time_ns()
+            _save_dict_with_progress(data, str(staging), on_progress, attrs=attrs)
+
+            def annotate_incomplete(path_: pathlib.Path) -> None:
+                import h5py
+
+                with h5py.File(path_, "r+") as quarantined:
+                    quarantined.attrs["complete"] = False
+                    quarantined.attrs["abort_reason"] = (
+                        self._invalidation_reason
+                        or abort_reason
+                        or "caller timed out waiting for save"
+                    )
+                    quarantined.attrs["abort_wall_ns"] = time.time_ns()
+
+            invalidated = self._save_invalidated.is_set()
+            if invalidated:
+                annotate_incomplete(staging)
+                if not complete:
+                    staging.replace(target)
+            else:
+                staging.replace(target)
+                published_final = bool(complete)
+
+            with self._disposition_lock:
+                late_invalidation = published_final and self._save_invalidated.is_set()
+                if not late_invalidation:
+                    self.saving = False
+            if late_invalidation:
+                partial = pathlib.Path(f"{target}.partial")
+                target.replace(partial)
+                annotate_incomplete(partial)
+                published_final = False
+                with self._disposition_lock:
+                    self.saving = False
+
+            output = (
+                pathlib.Path(f"{target}.partial")
+                if complete and self._save_invalidated.is_set()
+                else target
+            )
+            logger.info(f"EpisodeRecorder: {len(frames)} frames → {output}")
         except Exception as exc:
             self.last_save_error = exc
+            try:
+                staging.unlink(missing_ok=True)
+            except Exception as cleanup_exc:
+                exc.add_note(f"also failed to remove staging file {staging}: {cleanup_exc}")
+            if complete and published_final and target.exists():
+                # A late invalidation/disposition failure must never leave a nominal
+                # training file behind. Never remove a pre-existing target when this
+                # worker failed before it performed the atomic publication.
+                try:
+                    target.unlink(missing_ok=True)
+                except Exception as cleanup_exc:
+                    exc.add_note(f"also failed to remove published file {target}: {cleanup_exc}")
             logger.exception("EpisodeRecorder: save failed")
         finally:
-            self.saving = False
+            with self._disposition_lock:
+                self.saving = False
 
     def num_frames(self) -> int:
         """Return number of frames recorded so far"""

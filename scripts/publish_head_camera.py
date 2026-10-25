@@ -1,44 +1,10 @@
 #!/usr/bin/env python3
-"""Publish cropped ZED X Mini stereo frames (and optional depth) over Zenoh.
+"""Publish rectified head ZED stereo RGB and optional depth over Zenoh.
 
-Frames are cropped and resized before encoding so camera payloads do not congest the
-control link. Depth uses nearest-neighbor resizing to avoid averaging across depth
-discontinuities or mixing invalid pixels with valid values.
-
-  pyzed (ZED X Mini, GMSL port 0)
-     │
-     ├─ grab → LEFT view + RIGHT view (+ DEPTH only if --enable-depth)
-     │
-     ├─ crop [top:bottom, left:right]  then resize → (resize_h, resize_w)
-     │     RGB:   INTER_AREA   (anti-aliased downscale)
-     │     DEPTH: INTER_NEAREST (never average across depth discontinuities /
-     │            mix invalid 0/NaN pixels with valid ones)
-     │
-     ├─ publisher → sensors/<id>/left_rgb   (RGBImageCodec, RGB uint8)
-     ├─ publisher → sensors/<id>/right_rgb  (RGBImageCodec, RGB uint8)
-     ├─ publisher → sensors/<id>/depth      (DepthImageCodec, float32 m) [opt-in]
-     ├─ service   → sensors/<id>/info       (JsonDataCodec)
-     └─ service   → sensors/<id>/clock      (JsonDataCodec, publisher host clock)
-
-Topic naming matches the head_camera convention (left_rgb / right_rgb / depth)
-so dexcontrol's ``ZedCameraSensor`` subscribes to the same streams.
-
-IMPORTANT — only one process can hold the camera. Stop dexsensor's head_camera
-before running this::
-
-    dexsensor stop head_camera   # or just don't launch --sensor head_camera
-
-This is a long-running dependency, *not* a one-shot test — start it and leave it
-running for the whole recording session (no ``--duration``).
-
-Usage::
-
-    # production: matches recording rate, stereo RGB, default crop/resize
-    python scripts/publish_head_camera.py --serial-number <HEAD_SERIAL>
-    # add the SDK depth stream
-    python scripts/publish_head_camera.py --serial-number <HEAD_SERIAL> --enable-depth
-    # debug round-trip fps / inspect cropped frames
-    python scripts/publish_head_camera.py --serial-number <HEAD_SERIAL> --verify
+Crop/resize before encoding to bound network load. Depth uses nearest-neighbor
+resampling to preserve discontinuities and invalid values. Info and clock
+services expose calibration and capture-host timing. One process owns the camera;
+stop other head-camera drivers before starting this publisher.
 """
 
 from __future__ import annotations

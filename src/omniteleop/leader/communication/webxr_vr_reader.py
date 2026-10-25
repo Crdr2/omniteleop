@@ -1,40 +1,9 @@
 #!/usr/bin/env python3
-"""WebXR VR pose reader using Socket.IO — no Unity APK required.
+"""Serve the Quest WebXR client and receive poses through Socket.IO.
 
-Runs a Socket.IO server (via aiohttp) that:
-- Serves vr_client.html at GET /
-- Receives pose frames from the Quest 3 browser (WebXR)
-- Converts them to the same 4x4 robot-frame dict as
-  OpenXRUnitySocketClient._process_transformations()
-
-Usage::
-
-    from omniteleop.leader.communication.webxr_vr_reader import WebXRVRReader
-
-    reader = WebXRVRReader(port=5067)
-    reader.start()
-    reader.wait_for_data()
-
-    data = reader.get_latest_transformation()
-    # data["head"]               → 4x4 np.ndarray in robot frame
-    # data["left_wrist"]         → 4x4 np.ndarray in robot frame
-    # data["right_wrist"]        → 4x4 np.ndarray in robot frame
-    # data["left_index_trigger"] → float [0, 1]
-    # ... (same keys as _process_transformations controller mode)
-
-    reader.close()
-
-Connection setup
-----------------
-USB (recommended):
-  1. adb reverse tcp:5067 tcp:5067
-  2. Quest browser: http://localhost:5067
-  3. Tap "Start XR" — that's it.
-
-WiFi:
-  Quest browser: http://<PC_IP>:5067
-
-Note: WebXR does not expose elbow poses; left_elbow/right_elbow are identity.
+Convert browser poses to robot-frame 4x4 transforms and expose the latest frame.
+Use HTTPS for LAN addresses, or adb reverse tcp:5067 tcp:5067 with
+http://localhost:5067. WebXR has no elbow tracking; elbow transforms are identity.
 """
 
 import asyncio
@@ -64,6 +33,10 @@ class VRFrame(TypedDict):
     right_index_trigger: float
     left_grip_trigger: float
     right_grip_trigger: float
+    left_thumbstick: list[float]
+    right_thumbstick: list[float]
+    left_thumbstick_click: bool
+    right_thumbstick_click: bool
     right_a_button: bool
     right_b_button: bool
     left_x_button: bool
@@ -73,43 +46,26 @@ class VRFrame(TypedDict):
 def head_transform(qworld_t_xrquest: np.ndarray) -> np.ndarray:
     qworld_t_robworld = np.array([[0, -1, 0, 0], [0, 0, 1, 0], [-1, 0, 0, 0], [0, 0, 0, 1]])
     xrquest_t_opencvquest = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
-    robworld_t_opencvquest = (
-        np.linalg.inv(qworld_t_robworld) @ qworld_t_xrquest @ xrquest_t_opencvquest
-    )
-    return robworld_t_opencvquest
+    return np.linalg.inv(qworld_t_robworld) @ qworld_t_xrquest @ xrquest_t_opencvquest
 
 
 def right_eef_transform(qworld_t_xrquest: np.ndarray) -> np.ndarray:
     qworld_t_robworld = np.array([[0, -1, 0, 0], [0, 0, 1, 0], [-1, 0, 0, 0], [0, 0, 0, 1]])
     xrquest_t_opencvquest = np.array([[-1, 0, 0, 0], [0, 1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
-    robworld_t_opencvquest = (
-        np.linalg.inv(qworld_t_robworld) @ qworld_t_xrquest @ xrquest_t_opencvquest
-    )
-    return robworld_t_opencvquest
+    return np.linalg.inv(qworld_t_robworld) @ qworld_t_xrquest @ xrquest_t_opencvquest
 
 
 def left_eef_transform(qworld_t_xrquest: np.ndarray) -> np.ndarray:
     qworld_t_robworld = np.array([[0, -1, 0, 0], [0, 0, 1, 0], [-1, 0, 0, 0], [0, 0, 0, 1]])
     xrquest_t_opencvquest = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
-    robworld_t_opencvquest = (
-        np.linalg.inv(qworld_t_robworld) @ qworld_t_xrquest @ xrquest_t_opencvquest
-    )
-    return robworld_t_opencvquest
+    return np.linalg.inv(qworld_t_robworld) @ qworld_t_xrquest @ xrquest_t_opencvquest
 
 
-# ---------------------------------------------------------------------------
-# Pose helpers (reused from previous implementation)
-# ---------------------------------------------------------------------------
-
-
+# Pose decoding
 def _json_pose_to_matrix(pos: list, quat: list) -> np.ndarray:
-    """JSON pose → 4x4 robot-frame SE(3) matrix.
-
-    Mirrors process_pose(is_right_handed=False) + transform().
-    """
+    """Decode position and quaternion components into a 4x4 pose matrix."""
     pq = [pos[0], pos[1], pos[2], quat[0], quat[1], quat[2], quat[3]]
-    mat = pt.transform_from_pq(pq)
-    return mat
+    return pt.transform_from_pq(pq)
 
 
 def _process_frame(frame: dict) -> VRFrame:
@@ -131,6 +87,10 @@ def _process_frame(frame: dict) -> VRFrame:
         right_index_trigger=float(frame.get("right_index_trigger", 0.0)),
         left_grip_trigger=float(frame.get("left_squeeze", 0.0)),
         right_grip_trigger=float(frame.get("right_squeeze", 0.0)),
+        left_thumbstick=list(frame.get("left_thumbstick", [0.0, 0.0])),
+        right_thumbstick=list(frame.get("right_thumbstick", [0.0, 0.0])),
+        left_thumbstick_click=bool(frame.get("left_thumbstick_click", False)),
+        right_thumbstick_click=bool(frame.get("right_thumbstick_click", False)),
         right_a_button=bool(frame.get("right_a_button", False)),
         right_b_button=bool(frame.get("right_b_button", False)),
         left_x_button=bool(frame.get("left_x_button", False)),
@@ -138,11 +98,7 @@ def _process_frame(frame: dict) -> VRFrame:
     )
 
 
-# ---------------------------------------------------------------------------
 # WebXRVRReader
-# ---------------------------------------------------------------------------
-
-
 class WebXRVRReader:
     """Receives Quest 3 WebXR poses via Socket.IO and exposes robot-frame 4x4 matrices.
 
@@ -178,14 +134,11 @@ class WebXRVRReader:
         self._camera_lock = threading.Lock()
         self._sio: Optional[socketio.AsyncServer] = None
 
-    # ------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
-
     def set_frame_vis(self, key: str, b64_jpeg: str) -> None:
         """Push a base64-encoded JPEG frame to be emitted to the browser.
 
-        Called from outside, for example by camera callbacks.
+        Called from outside (e.g. vr_reader.py camera callbacks).
         """
         with self._camera_lock:
             self._camera_frames[key] = b64_jpeg
@@ -229,10 +182,7 @@ class WebXRVRReader:
             self._thread.join(timeout=3.0)
         logger.info("WebXRVRReader: closed.")
 
-    # ------------------------------------------------------------------
     # Internal
-    # ------------------------------------------------------------------
-
     def _build_app(self) -> aiohttp.web.Application:
         sio = socketio.AsyncServer(async_mode="aiohttp", cors_allowed_origins="*")
         self._sio = sio
@@ -260,7 +210,7 @@ class WebXRVRReader:
             html_path = os.path.abspath(_HTML_PATH)
             # No Cache-Control => the Quest browser caches vr_client.html
             # heuristically and serves a stale copy after we edit it (e.g. the
-            # camera-quad geometry), so restarting the leader appears to do
+            # camera-quad geometry), so restarting vr_reader.py appears to do
             # nothing. Forbid caching so every page load re-fetches the latest.
             return aiohttp.web.FileResponse(
                 html_path,

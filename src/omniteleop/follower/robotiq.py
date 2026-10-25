@@ -31,14 +31,17 @@ def modbus_crc(data: bytes) -> bytes:
     return crc.to_bytes(2, byteorder="little")
 
 
-def build_hande_command(pos: float, speed: float = 1.0, force: float = 1.0) -> bytes:
-    """Build a Robotiq Hand-E 'go to position' Modbus RTU command.
+def build_hande_command(
+    pos: float, speed: float = 1.0, force: float = 1.0, *, go_to: bool = True
+) -> bytes:
+    """Build a Robotiq Hand-E go-to or activated-stop Modbus RTU command.
 
     Args:
         pos:   normalized position in [0.0, 1.0]
                0.0 = fully open, 1.0 = fully closed
         speed: normalized speed in [0.0, 1.0]
         force: normalized force in [0.0, 1.0]
+        go_to: False clears rGTO to stop without opening or deactivating the gripper.
     """
     pos = max(0.0, min(1.0, pos))
     speed = max(0.0, min(1.0, speed))
@@ -51,9 +54,8 @@ def build_hande_command(pos: float, speed: float = 1.0, force: float = 1.0) -> b
     # Function 0x10 = write multiple registers
     # Start address = 0x03E8
     # Write 3 registers = 6 data bytes
-    #
     # Data bytes:
-    #   [0]=ACTION REQUEST   = 0x09  (rACT=1, rGTO=1)
+    #   [0]=ACTION REQUEST   = 0x09 go-to, 0x01 stop (rACT stays 1)
     #   [1]=GRIPPER OPTIONS  = 0x00
     #   [2]=OPTIONS 2        = 0x00
     #   [3]=POSITION REQUEST = rPR
@@ -68,7 +70,7 @@ def build_hande_command(pos: float, speed: float = 1.0, force: float = 1.0) -> b
             0x00,
             0x03,
             0x06,
-            0x09,
+            0x09 if go_to else 0x01,
             0x00,
             0x00,
             rPR,
@@ -163,6 +165,11 @@ class RobotiqStatusMonitor:
         self._pending_requests: Deque[Dict[str, Any]] = deque()
         self._counters: Counter[str] = Counter()
         self._next_request_id = 0
+        # Modbus RTU replies carry no transaction id. After a request times out, the
+        # next syntactically valid FC03 reply is therefore ambiguous: it may be the late
+        # old reply or the reply to a replacement request. Sacrifice that one reply (and
+        # any replacement pending slot) rather than assigning fabricated provenance.
+        self._status_attribution_barrier = 0
         node = getattr(arm, "_node", None)
         if node is None:
             raise ValueError("arm has no dexcomm node")
@@ -213,9 +220,19 @@ class RobotiqStatusMonitor:
                 self._counters["other_status_discarded"] += 1
                 return
 
+            if self._status_attribution_barrier > 0:
+                self._status_attribution_barrier -= 1
+                if self._pending_requests:
+                    self._pending_requests.popleft()
+                    self._counters["ambiguous_pending_requests_discarded"] += 1
+                self._counters["ambiguous_statuses_discarded"] += 1
+                return
             request_event = self._pending_requests.popleft() if self._pending_requests else None
             if request_event is None:
+                # An unsolicited/late reply has no defensible request timestamps. Never
+                # expose it as obs/gripper provenance merely because its CRC is valid.
                 self._counters["unmatched_statuses"] += 1
+                return
             parsed = dict(parsed or {})
             parsed["response_timestamp_ns"] = (
                 resp.get("timestamp_ns") if isinstance(resp, dict) else None
@@ -264,15 +281,40 @@ class RobotiqStatusMonitor:
                     }
                 )
             self._counters["status_timeouts"] += len(expired)
+            self._status_attribution_barrier += len(expired)
         return expired
 
     def stats(self) -> Dict[str, int]:
         """Return monitor counters plus current queue depths."""
+        now_ns = time.monotonic_ns()
         with self._lock:
             stats = dict(self._counters)
             stats["queued_statuses"] = len(self._statuses)
             stats["pending_status_requests"] = len(self._pending_requests)
+            stats["status_attribution_barrier"] = self._status_attribution_barrier
+            stats["oldest_pending_age_ms"] = (
+                0
+                if not self._pending_requests
+                else max(
+                    0,
+                    (now_ns - int(self._pending_requests[0]["send_monotonic_ns"])) // 1_000_000,
+                )
+            )
         return stats
+
+    def pending_request_age_s(self) -> Optional[float]:
+        """Age of the oldest outstanding FC03/FC04 request, or ``None``.
+
+        The Hand-E pass-through is one shared Modbus request/response path.  A
+        command scheduler can use this age to leave a short write-free window after
+        a status request without freezing gripper control for an entire timeout.
+        """
+        now_ns = time.monotonic_ns()
+        with self._lock:
+            if not self._pending_requests:
+                return None
+            sent_ns = int(self._pending_requests[0]["send_monotonic_ns"])
+        return max(0.0, (now_ns - sent_ns) / 1e9)
 
     def close(self) -> None:
         """Best-effort subscriber cleanup for dexcomm versions that expose it."""
@@ -308,7 +350,7 @@ def discard_ee_pass_through_response(
         current = getattr(arm, "_latest_ee_pass_through_data", None)
         if expected_response is not None and current is not expected_response:
             return False
-        arm._latest_ee_pass_through_data = None  # noqa: SLF001 - consume dexcontrol slot
+        arm._latest_ee_pass_through_data = None
     return True
 
 

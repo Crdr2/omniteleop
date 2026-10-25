@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""Pure command-stream helpers for WBC VR teleoperation.
+"""Pose decoding, target interpolation, and head/base command shaping.
 
-These primitives provide per-tick lerp/slerp interpolation of low-rate pose commands,
-head-target filtering, base command postprocessing, and flat-to-4x4 pose decoding.
-
-Deliberately depends on only numpy and scipy -- no robot or solver libraries
-and, crucially, no ``omniteleop.follower`` package ``__init__`` (which is heavy and
-pulls hardware dependencies). That keeps this module safe to import without robot or
-solver dependencies.
+Followers share these numpy/scipy-only helpers so live and replayed command
+streams use the same interpolation and filtering without importing hardware.
 """
 
 from __future__ import annotations
@@ -145,21 +140,11 @@ def deadband_planar_twist_by_reference(
 
 
 class TargetInterpolator:
-    """Per-tick lerp/slerp of the leader's low-rate pose commands.
+    """Interpolate each low-rate Cartesian command over its segment duration.
 
-    Generic over the number of pose streams -- here L_ee, R_ee, and the head frame
-    all ride the same segments. The leader publishes commands at ``--cmd-rate``
-    (default 10 Hz) while the IK runs at ``--rate`` (default 100 Hz). Each arriving
-    command starts a new blend segment toward it, traversed in ``duration``:
-    ``alpha = min(1, elapsed/duration)``, position lerped, orientation slerped. This
-    The segment starts at the previous raw command target, not the current interpolated
-    output. ``duration <= 0`` degrades to pass-through (zero-order hold).
-
-    The default segment duration is fixed at construction (``1/cmd-rate``). A single
-    :meth:`push` may override it via ``duration=`` -- needed for slow/uneven REPLAY,
-    where each segment must span the *stretched* inter-command interval
-    (recorded inter-arrival dt / speed); otherwise the glide finishes in
-    ``1/cmd-rate`` and then holds, turning slow replay into a staircase.
+    Translations use linear interpolation and rotations use slerp. A new target
+    starts from the previous raw command; stale-target handling belongs to
+    the caller. reset() establishes a new segment without an initial jump.
     """
 
     def __init__(self, duration: float, *poses0: np.ndarray) -> None:

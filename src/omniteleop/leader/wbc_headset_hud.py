@@ -26,6 +26,26 @@ _DEFAULT_HUD_CAMERAS: list[CameraStream] = [
     "head_left_rgb",
     "right_wrist_rgb",
 ]
+HUD_RGB_CAMERAS = ("head_left_rgb", "head_right_rgb", "left_wrist_rgb", "right_wrist_rgb")
+
+
+def order_hud_cameras(
+    cameras: list[CameraStream],
+    center_camera: Optional[CameraStream] = None,
+) -> list[CameraStream]:
+    """Place the requested RGB view in the middle, preserving other RGB views' order."""
+    cameras = list(dict.fromkeys(cameras or _DEFAULT_HUD_CAMERAS))
+    if center_camera is None:
+        return cameras
+    if center_camera not in HUD_RGB_CAMERAS or center_camera not in cameras:
+        raise ValueError("--hud-center-camera must name an RGB stream included in --hud-cameras")
+    visible = [c for c in cameras if c != "head_depth"]
+    visible.remove(center_camera)
+    visible.insert((len(visible) + 1) // 2, center_camera)
+    # Depth is polled but not rendered, so it must not affect the center tile index.
+    return visible + [c for c in cameras if c == "head_depth"]
+
+
 _HEAD_STREAM_TO_OBS_KEY: dict[CameraStream, str] = {
     "head_left_rgb": "left_rgb",
     "head_right_rgb": "right_rgb",
@@ -38,13 +58,14 @@ _WRIST_STREAM_TO_SENSOR_ID: dict[CameraStream, str] = {
     "left_wrist_rgb": "left_wrist_zedm",
     "right_wrist_rgb": "right_wrist_zedm",
 }
-# Every wrist publisher sends only its stereo left eye by default, so this is the
-# observation key for both wrist sensors.
+# Every wrist publisher sends only its stereo left eye (tests/test_wrist_zedm_depth.py
+# defaults to --skip-right-rgb), so this is the obs key for BOTH wrist sensors.
 _WRIST_OBS_KEY = "left_rgb"
 
 _WHITE = (255, 255, 255)
 _RED = (0, 0, 255)
 _YELLOW = (0, 255, 255)
+_ALIGNMENT_PURPLE = (180, 30, 120)  # BGR; strong contrast against white camera backgrounds
 _GREEN = (0, 255, 0)
 
 # Camera-tile geometry for the composed HUD frame. Tiles are concatenated horizontally
@@ -162,6 +183,18 @@ def follower_status_overlay_lines(
         return ["Follower: no status"]
 
     lines = []
+    # Which episode_<N>.hdf5 the current/next take saves as. Comes from the FOLLOWER's
+    # recorder (the leader has no recorder of its own), and is -1 when the follower runs
+    # without --record -- then there is no file to name, so the line is dropped.
+    if status.episode_id >= 0:
+        lines.append(f"Episode: {status.episode_id}")
+    if status.home_required:
+        lines.append("Home first: press LEFT index trigger.")
+    elif status.scenediff_enabled:
+        if status.scenediff_state == "ready":
+            lines.append("Scan saved. Release + hold RIGHT grip.")
+        elif not status.scenediff_state:
+            lines.append("Hold RIGHT grip: park arms + scan.")
     if status.stage == WBC_FOLLOWER_STAGE_ABORTED:
         # Terminal frame: the follower process died. hold_reason carries the exception's
         # first line; this status never refreshes, so the line (and abort_banner) persist.
@@ -199,6 +232,12 @@ def abort_banner(status: Optional[WBCFollowerStatus]) -> Optional[HUDOverlayLine
     if status is None or status.stage != WBC_FOLLOWER_STAGE_ABORTED:
         return None
     return HUDOverlayLine("FOLLOWER ABORTED - CHECK TERMINAL", _RED)
+
+
+def home_banner(status: Optional[WBCFollowerStatus]) -> Optional[HUDOverlayLine]:
+    if status is not None and status.home_required:
+        return HUDOverlayLine("HOME FIRST - PRESS LEFT INDEX TRIGGER", _YELLOW)
+    return None
 
 
 def collision_banner(status: Optional[WBCFollowerStatus]) -> Optional[HUDOverlayLine]:
@@ -266,7 +305,7 @@ def _hand_alignment_line(
     else:
         vec = "nan nan nan"
     label = _hand_alignment_label(delta, rot_deg, pos_tolerance_mm, rot_tolerance_deg)
-    color = _GREEN if label == "OK" else _YELLOW
+    color = _GREEN if label == "OK" else _ALIGNMENT_PURPLE
     return HUDOverlayLine(
         f"{side} dxyz=[{vec}]mm rot={rot_deg:.0f}deg {label}",
         color,
@@ -284,7 +323,7 @@ def alignment_overlay_lines(alignment: Optional[HandAlignmentStatus]) -> list[HU
         else "Align ref: move hands to reference"
     )
     lines = [
-        HUDOverlayLine(prompt, _YELLOW),
+        HUDOverlayLine(prompt, _ALIGNMENT_PURPLE),
         _hand_alignment_line(
             "L",
             alignment.left_delta_mm,
@@ -316,20 +355,27 @@ def alignment_overlay_lines(alignment: Optional[HandAlignmentStatus]) -> list[HU
         lines.append(
             HUDOverlayLine(
                 f"Gate: align {alignment.stable_s:.1f}/{alignment.stable_required_s:.1f}s",
-                _YELLOW,
+                _ALIGNMENT_PURPLE,
             )
         )
     else:
-        lines.append(HUDOverlayLine("Gate: align", _YELLOW))
+        lines.append(HUDOverlayLine("Gate: align", _ALIGNMENT_PURPLE))
     return lines
 
 
 class WBCHeadsetHUD:
     """Poll robot camera streams and push a composed HUD frame to the Quest browser."""
 
-    def __init__(self, quest, cameras: list[CameraStream]) -> None:
+    def __init__(
+        self,
+        quest,
+        cameras: list[CameraStream],
+        *,
+        sim_namespace=None,
+        center_camera: Optional[CameraStream] = None,
+    ) -> None:
         self.quest = quest
-        self.cameras = list(dict.fromkeys(cameras or _DEFAULT_HUD_CAMERAS))
+        self.cameras = order_hud_cameras(cameras, center_camera)
         self._head_keys = [
             _HEAD_STREAM_TO_OBS_KEY[c] for c in self.cameras if c in _HEAD_STREAM_TO_OBS_KEY
         ]
@@ -351,12 +397,41 @@ class WBCHeadsetHUD:
         self._running = False
         self._period = float("inf")
 
+        self._sim_node = None
+        self._sim_subscribers = []
+        if sim_namespace is not None:
+            from dexcomm import Node
+            from dexcomm.codecs import RGBImageCodec
+
+            self._sim_node = Node(name="behavior_headset_cameras", namespace=sim_namespace)
+            for stream in self.cameras:
+                if stream == "head_left_rgb":
+                    sensor, cache, key = "head_camera", self._last_head_imgs, "left_rgb"
+                elif stream in _WRIST_STREAM_TO_SENSOR_ID:
+                    sensor, cache, key = (
+                        _WRIST_STREAM_TO_SENSOR_ID[stream],
+                        self._last_wrist_imgs,
+                        stream,
+                    )
+                else:
+                    raise ValueError(f"BEHAVIOR HUD does not publish {stream}")
+
+                def receive(data, cache=cache, key=key):
+                    cache[key] = np.asarray(data["data"])
+
+                self._sim_subscribers.append(
+                    self._sim_node.create_subscriber(
+                        f"sensors/{sensor}/left_rgb", receive, decoder=RGBImageCodec.decode
+                    )
+                )
+            return
+
         try:
-            from dexbot_utils.configs.components.sensors.cameras import (  # noqa: PLC0415
+            from dexbot_utils.configs.components.sensors.cameras import (
                 ZedXCameraConfig,
             )
-            from dexcontrol.core.config import get_robot_config  # noqa: PLC0415
-            from dexcontrol.robot import Robot as _Robot  # noqa: PLC0415
+            from dexcontrol.core.config import get_robot_config
+            from dexcontrol.robot import Robot as _Robot
 
             configs = get_robot_config()
             if self._head_keys:
@@ -408,8 +483,7 @@ class WBCHeadsetHUD:
         self._last_camera_warn_t = now
         print(f"[wbc_vr_leader] WARNING: headset HUD camera poll failed: {exc}")
 
-    # -- background render loop (keeps the HUD off the teleop control path) ------
-
+    # background render loop (keeps the HUD off the teleop control path)
     def start(self, rate: float) -> None:
         """Start the background HUD loop at ``rate`` Hz (idempotent).
 
@@ -642,7 +716,7 @@ class WBCHeadsetHUD:
         # Prominent alert, drawn last so it sits on top. Uses the follower status
         # already polled above -- no extra data path, no added latency. A follower
         # abort (terminal, process dead) outranks a live self-collision warning.
-        banner = abort_banner(status) or collision_banner(status)
+        banner = abort_banner(status) or home_banner(status) or collision_banner(status)
         if banner is not None:
             self._draw_banner(vis_img, banner.text, banner.color)
 

@@ -55,6 +55,8 @@ packages = ["src/omniteleop"]
 include = [
     "src/omniteleop",
     "scripts",
+    "hardware/vega_iphone_mount",
+    "third_party/record3d",
     "config/ee_offset.example.yaml",
     ".gitignore",
     ".python-version",
