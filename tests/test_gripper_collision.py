@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
+import yaml
 
 from omniteleop.follower.gripper_collision import (
     enclose_interval,
@@ -11,7 +14,13 @@ from omniteleop.follower.gripper_collision import (
     pose_open_points,
 )
 from omniteleop.follower.robotiq import build_hande_command
-from omniteleop.follower.whole_body_ik import VegaWholeBodyIK
+from omniteleop.follower.whole_body_ik import (
+    DEFAULT_CONFIG_PATH,
+    ROBOTIQ_FIXED_PROXY_SPHERES,
+    ROBOTIQ_PROXY_SPHERES,
+    VegaWholeBodyIK,
+    WBCConfig,
+)
 
 
 def _status(**changes):
@@ -110,7 +119,7 @@ def test_interval_encloses_continuous_sphere_motion(side):
 
 
 def test_geometry_updates_same_q_barrier_coal_and_probe_caches():
-    ik = VegaWholeBodyIK()
+    ik = VegaWholeBodyIK(WBCConfig(dynamic_gripper_collision=True, phone_mount_collision=True))
     q = ik.configuration.q.copy()
     sm = ik.collision_sphere_model
     pairs = [(p.first, p.second) for p in sm.collisionPairs]
@@ -136,4 +145,57 @@ def test_geometry_updates_same_q_barrier_coal_and_probe_caches():
     ik.update_gripper_collision_geometry()
     np.testing.assert_allclose(
         np.sort(barrier.compute_qp_inequalities(ik.configuration, 0.01)[1]), np.sort(original)
+    )
+
+
+def test_optional_collision_geometry_defaults_to_fixed_grippers_without_mount():
+    cfg = WBCConfig.from_yaml()
+    assert not cfg.dynamic_gripper_collision
+    assert not cfg.phone_mount_collision
+    assert cfg.enable_collision_avoidance
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("mount", [False, True])
+def test_yaml_options_select_collision_geometry_independently(tmp_path, dynamic, mount):
+    data = yaml.safe_load(Path(DEFAULT_CONFIG_PATH).read_text())
+    data.update(dynamic_gripper_collision=dynamic, phone_mount_collision=mount)
+    config = tmp_path / "wbik.yaml"
+    config.write_text(yaml.safe_dump(data))
+    ik = VegaWholeBodyIK(config_path=config)
+    geoms = {g.name: g for g in ik.collision_sphere_model.geometryObjects}
+    expected = ROBOTIQ_PROXY_SPHERES if dynamic else ROBOTIQ_FIXED_PROXY_SPHERES
+    for prefix in ("L_robotiq", "R_robotiq"):
+        assert {n for n in geoms if n.startswith(prefix)} == {
+            f"{prefix}_{label}" for label, _, _ in expected
+        }
+    assert sum("phone_mount" in n for n in geoms) == (33 if mount else 0)
+    assert bool(ik._gripper_collision) is dynamic
+    assert ik.collision_enabled and ik.collision_barrier is not None
+    if not dynamic:
+        # Fixed spheres keep the earlier centers/radii, not just the earlier count.
+        for prefix in ("L_robotiq", "R_robotiq"):
+            frame = ik.model.frames[ik.model.getFrameId(prefix)]
+            for label, xyz, radius in expected:
+                geom = geoms[f"{prefix}_{label}"]
+                np.testing.assert_allclose(
+                    geom.placement.translation,
+                    frame.placement.act(np.asarray(xyz)),
+                )
+                assert geom.geometry.radius == radius
+
+
+def test_fixed_gripper_geometry_ignores_feedback_without_recomputing_distances(monkeypatch):
+    ik = VegaWholeBodyIK()
+    original = ik.collision_barrier.compute_qp_inequalities(ik.configuration, 0.01)[1].copy()
+
+    def unexpected_update(*args):
+        pytest.fail("fixed gripper geometry must not trigger a configuration update")
+
+    monkeypatch.setattr(ik.configuration, "update", unexpected_update)
+    ik.update_gripper_collision_geometry(left=(0.8, 0.8), right=(0.7, 0.7))
+    ik.update_gripper_collision_geometry()
+    np.testing.assert_array_equal(
+        ik.collision_barrier.compute_qp_inequalities(ik.configuration, 0.01)[1],
+        original,
     )

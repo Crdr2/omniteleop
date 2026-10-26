@@ -97,11 +97,10 @@ damping: 1.0e-6
 # a proactive SelfCollisionBarrier CBF in the QP (safe_dist) plus the reactive
 # SafetyGate hold as the hard backstop (floor).
 enable_collision_avoidance: true
-# The iPhone ARKit mount above the left E-stop (hardware/vega_iphone_mount): 33 spheres
-# cover the wide pedestal and thin cradle/phone/top-stop envelope, with 2 mm assembly
-# padding (whole_body_ik.PHONE_MOUNT_PROXY_SPHERES). Both arms keep clear in every
-# follower. false only for a robot without the mount.
-phone_mount_collision: true
+# Opt in to measured-width fingertip geometry; false uses fixed full-stroke spheres.
+dynamic_gripper_collision: false
+# Opt in to the base-mounted iPhone collision envelope (33 proxy spheres).
+phone_mount_collision: false
 # Use the body-only sphere URDF. The solver adds Robotiq, wrist-camera, and
 # phone-mount proxies; the Dexmate gripper sphere model is a different geometry.
 collision_spheres_urdf: "${dexmate_urdf}/robots/humanoid/vega_1/vega_1_collision_spheres.collision.urdf"

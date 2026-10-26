@@ -140,6 +140,16 @@ ROBOTIQ_PROXY_SPHERES: tuple[tuple[str, tuple[float, float, float], float], ...]
     ("finger_neg", (-0.050, 0.0, -0.125), 0.055),
 ) + _robotiq_fingertip_proxy_spheres()
 
+# Fixed spheres cover the full opening sweep without measured-width updates.
+ROBOTIQ_FIXED_PROXY_SPHERES = ROBOTIQ_PROXY_SPHERES[:3] + (
+    ("tip_root_pos", (0.041, 0.0, -0.068), 0.055),
+    ("tip_root_neg", (-0.041, 0.0, -0.068), 0.055),
+    ("tip_mid_pos", (0.041, 0.0, -0.014), 0.055),
+    ("tip_mid_neg", (-0.041, 0.0, -0.014), 0.055),
+    ("tip_end_pos", (0.041, 0.0, 0.040), 0.055),
+    ("tip_end_neg", (-0.041, 0.0, 0.040), 0.055),
+)
+
 # Wrist-camera proxy spheres in each L/R_wrist_zed_mini frame;
 # they move with the arm and supplement the body-only collision-sphere URDF.
 WRIST_CAM_PROXY_SPHERES: tuple[tuple[str, tuple[float, float, float], float], ...] = (
@@ -384,8 +394,8 @@ class WBCConfig:
     # The barrier degrades gracefully to off (with a warning) if pink lacks barriers or
     # the sphere URDF is unavailable.
     enable_collision_avoidance: bool = _DEFAULTS["enable_collision_avoidance"]
-    # Add PHONE_MOUNT_PROXY_SPHERES to the base, so both arms keep clear of the iPhone
-    # mount in every follower. Off only for a robot without the mount.
+    # Optional measured-width grippers and base-mounted phone envelope.
+    dynamic_gripper_collision: bool = _DEFAULTS["dynamic_gripper_collision"]
     phone_mount_collision: bool = _DEFAULTS["phone_mount_collision"]
     enable_com_safety: bool = _DEFAULTS["enable_com_safety"]  # hard CoM-over-base inequality
     collision_spheres_urdf: str = _DEFAULTS["collision_spheres_urdf"]
@@ -515,12 +525,17 @@ class VegaWholeBodyIK:
     def _add_proxy_collision_spheres(
         model: pin.Model,
         geometry_model: pin.GeometryModel,
+        *,
+        dynamic_gripper_collision: bool = False,
     ) -> None:
-        """Append the open Robotiq / fixed wrist-camera proxies, per frame present."""
+        """Append selected Robotiq and fixed wrist-camera proxies, per frame present."""
         existing = {obj.name for obj in geometry_model.geometryObjects}
+        gripper_spheres = (
+            ROBOTIQ_PROXY_SPHERES if dynamic_gripper_collision else ROBOTIQ_FIXED_PROXY_SPHERES
+        )
         for frame_name, spheres in (
-            (LEFT_GRIPPER_FRAME, ROBOTIQ_PROXY_SPHERES),
-            (RIGHT_GRIPPER_FRAME, ROBOTIQ_PROXY_SPHERES),
+            (LEFT_GRIPPER_FRAME, gripper_spheres),
+            (RIGHT_GRIPPER_FRAME, gripper_spheres),
             (LEFT_WRIST_CAM_FRAME, WRIST_CAM_PROXY_SPHERES),
             (RIGHT_WRIST_CAM_FRAME, WRIST_CAM_PROXY_SPHERES),
         ):
@@ -607,7 +622,11 @@ class VegaWholeBodyIK:
         self.visual_model, self.collision_model = reduced_geoms[0], reduced_geoms[1]
         self.collision_sphere_model = reduced_geoms[2] if sphere_full is not None else None
         if self.collision_sphere_model is not None:
-            self._add_proxy_collision_spheres(self.model, self.collision_sphere_model)
+            self._add_proxy_collision_spheres(
+                self.model,
+                self.collision_sphere_model,
+                dynamic_gripper_collision=cfg.dynamic_gripper_collision,
+            )
             if cfg.phone_mount_collision:
                 self._add_phone_mount_spheres(self.model, self.collision_sphere_model)
 
@@ -745,7 +764,8 @@ class VegaWholeBodyIK:
         self._probe_geom_data = None
         self._gripper_collision = {}
         if self.collision_sphere_model is not None:
-            self._init_gripper_collision_geometry()
+            if cfg.dynamic_gripper_collision:
+                self._init_gripper_collision_geometry()
             self._setup_collision_pairs()
 
         # Resolve the tip-over centroid proxy (a torso frame, or the true CoM).
@@ -788,6 +808,8 @@ class VegaWholeBodyIK:
         None (or an invalid interval) covers the full calibrated stroke. Pair indices
         never change; update both distance caches and Pink's same-q barrier cache.
         """
+        if not self.config.dynamic_gripper_collision:
+            return
         changed = False
         sm = self.collision_sphere_model
         for side, interval in (("left", left), ("right", right)):

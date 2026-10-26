@@ -50,7 +50,9 @@ def _to_mat(pose) -> np.ndarray:
 
 def _make(**cfg_overrides):
     """Build a solver; return ``(ik, left0_mat, right0_mat)``."""
-    ik = VegaWholeBodyIK(WBCConfig(**cfg_overrides))
+    options = dict(dynamic_gripper_collision=True, phone_mount_collision=True)
+    options.update(cfg_overrides)
+    ik = VegaWholeBodyIK(WBCConfig(**options))
     ik.reset()
     return ik, _to_mat(ik.frame_pose(LEFT_EE_FRAME)), _to_mat(ik.frame_pose(RIGHT_EE_FRAME))
 

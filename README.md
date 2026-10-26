@@ -188,7 +188,10 @@ settled parking-reference HDF5 passed via `--scenediff-park-reference`. Neither 
 for the basic pipeline above; task data and policy training are not bundled.
 
 The bundled model includes wrist-camera frames, gripper collision proxies, and a
-conservative phone-mount envelope. It has no render meshes. Gripper stroke calibration
+optional phone-mount envelope. `dynamic_gripper_collision: false` uses fixed full-stroke
+gripper spheres; set it to `true` for feedback-based fingertip geometry.
+`phone_mount_collision: false` omits the phone-mount spheres; enable it to include the
+mount envelope. General self-collision avoidance stays enabled. The model has no render meshes. Gripper stroke calibration
 and mount geometry describe the current hardware setup; review them for other mounts
 or fingertips.
 

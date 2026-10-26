@@ -113,7 +113,14 @@ def episode3_pose(ik):
 
 
 def test_recorded_elbow_clearance_removes_false_warning():
-    ik = VegaWholeBodyIK(WBCConfig(lock_base_in_ik=True, head_mode="fixed"))
+    ik = VegaWholeBodyIK(
+        WBCConfig(
+            lock_base_in_ik=True,
+            head_mode="fixed",
+            phone_mount_collision=True,
+            dynamic_gripper_collision=True,
+        )
+    )
     q = episode3_pose(ik)
     assert ik.config.self_collision_warn_dist == 0.03
     assert ik.config.self_collision_safe_dist == 0.02
@@ -124,7 +131,15 @@ def test_recorded_elbow_clearance_removes_false_warning():
 
 
 def test_deliberate_mount_approach_retains_collision_protection():
-    ik = VegaWholeBodyIK(WBCConfig(lock_base_in_ik=True, lock_torso_in_ik=True, head_mode="fixed"))
+    ik = VegaWholeBodyIK(
+        WBCConfig(
+            lock_base_in_ik=True,
+            lock_torso_in_ik=True,
+            head_mode="fixed",
+            phone_mount_collision=True,
+            dynamic_gripper_collision=True,
+        )
+    )
     ik.reset(episode3_pose(ik))
     left = ik.frame_pose("L_ee").homogeneous
     right = ik.frame_pose("R_ee").homogeneous
